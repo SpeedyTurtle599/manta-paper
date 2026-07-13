@@ -1,0 +1,78 @@
+{
+  // ----------------------------------------------------------------------
+  // Build tools. latexmk -xelatex auto-detects the biblatex/.bcf and runs
+  // biber itself, so the primary recipe is a single latexmk invocation.
+  // An explicit XeLaTeX -> Biber -> XeLaTeX x2 recipe is provided as a
+  // fallback in case latexmk's auto-biber ever misfires.
+  // ----------------------------------------------------------------------
+  "latex-workshop.latex.tools": [
+    {
+      "name": "latexmk-xelatex",
+      "command": "/opt/homebrew/bin/latexmk",
+      "args": [
+        "-synctex=1",
+        "-interaction=nonstopmode",
+        "-file-line-error",
+        "-xelatex",
+        "-outdir=%OUTDIR%",
+        "%DOC%"
+      ]
+    },
+    {
+      "name": "xelatex",
+      "command": "/opt/homebrew/bin/xelatex",
+      "args": [
+        "-synctex=1",
+        "-interaction=nonstopmode",
+        "-file-line-error",
+        "%DOC%"
+      ]
+    },
+    {
+      "name": "biber",
+      "command": "/opt/homebrew/bin/biber",
+      "args": [
+        "%DOCFILE%"
+      ]
+    }
+  ],
+  "latex-workshop.latex.recipes": [
+    {
+      "name": "latexmk (XeLaTeX + Biber)",
+      "tools": [
+        "latexmk-xelatex"
+      ]
+    },
+    {
+      "name": "XeLaTeX + Biber (explicit)",
+      "tools": [
+        "xelatex",
+        "biber",
+        "xelatex",
+        "xelatex"
+      ]
+    }
+  ],
+  "latex-workshop.latex.recipe.default": "first",
+
+  // ----------------------------------------------------------------------
+  // Multi-document workspace: this folder holds both "Coveler ESA.tex" and
+  // "solver/manta.tex". Build whichever document is in the active editor,
+  // and keep all build artefacts (.bcf/.bbl/.aux/.pdf) next to its .tex so
+  // biber finds the .bcf and the local refs_*.bib / new-aiaa.cls resolve.
+  // ----------------------------------------------------------------------
+  "latex-workshop.latex.outDir": "%DIR%",
+  "latex-workshop.latex.rootFile.doNotPrompt": true,
+  "latex-workshop.latex.search.rootFiles.include": [
+    "**/*.tex"
+  ],
+
+  // ----------------------------------------------------------------------
+  // Auto-build on save; clean intermediates after a successful build but
+  // never delete the PDF.
+  // ----------------------------------------------------------------------
+  "latex-workshop.latex.autoBuild.run": "onSave",
+  "latex-workshop.latex.autoClean.run": "onBuilt",
+  "latex-workshop.latex.clean.method": "auto",
+  "latex-workshop.view.pdf.viewer": "tab"
+}

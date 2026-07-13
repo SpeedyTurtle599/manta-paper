@@ -1,0 +1,15 @@
+**.DS_Store
+/manta
+
+**/*.aux
+**/*.bbl
+**/*.bcf
+**/*.blg
+**/*.fdb_latexmk
+**/*.fls
+**/*.log
+**/*.out
+**/*.pdf
+**/*.run.xml
+**/*.synctex.gz
+**/*.xdv

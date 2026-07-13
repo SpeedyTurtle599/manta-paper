@@ -1,0 +1,975 @@
+% !TeX program = xelatex
+\documentclass[journal,biblatex]{new-aiaa}
+
+\usepackage{textcomp}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage[version=4]{mhchem}
+\usepackage{siunitx}
+\DeclareSIUnit{\atm}{atm}
+\usepackage{booktabs}
+\usepackage{longtable,tabularx}
+\usepackage{array}
+\usepackage{xurl}
+\usepackage{float}
+\usepackage[backend=biber,style=numeric-comp,sorting=none]{biblatex}
+
+\addbibresource{cite/General.bib}
+\addbibresource{cite/Gases and Thermochemistry.bib}
+\addbibresource{cite/Implicit Integration and Preconditioning.bib}
+\addbibresource{cite/Meshing.bib}
+\addbibresource{cite/Reconstruction.bib}
+\addbibresource{cite/Riemann Solvers.bib}
+\addbibresource{cite/Turbulence.bib}
+\addbibresource{cite/Verification and Validation.bib}
+\addbibresource{cite/Viscous Transport.bib}
+
+\setlength\LTleft{0pt}
+
+% Figure placeholder: \figplace[width]{file}{placeholder-height}.
+% Renders a framed stub until figures/<file> exists, then automatically
+% switches to \includegraphics of the real file -- no edit needed here.
+% Use hyphens (not underscores) in figure filenames.
+\newcommand{\figplace}[3][0.9\linewidth]{%
+  \IfFileExists{figures/#2}%
+    {\includegraphics[width=#1]{figures/#2}}%
+    {\fbox{\parbox[c][#3][c]{#1}{\centering\texttt{figures/#2}\\[2pt]%
+      \footnotesize placeholder --- spec in \texttt{figures/README.md}}}}}
+
+% Convenience macros
+\newcommand{\U}{\mathbf{U}}
+\newcommand{\Field}[1]{\texttt{#1}}
+\newcommand{\half}{\tfrac12}
+\newcommand{\divg}{\nabla\!\cdot\!}
+\newcommand{\nhat}{\hat{\mathbf{n}}}
+
+\title{MANTA: A Modular Aero-thermo-chemical Nonequilibrium Transport Architecture}
+
+\author{Benjamin G. Coveler\footnote{Research Postgraduate, Department of Aeronautics, benjamin.coveler25@imperial.ac.uk.}, Paul J.~K. Bruce\footnote{Associate Professor of High-Speed Aerodynamics, Department of Aeronautics.}, and Matthew J. Santer\footnote{Professor of Aerospace Structures, Department of Aeronautics, AIAA Associate Fellow.}}
+\affil{Imperial College London, London, SW7 2AZ, United Kingdom}
+
+\begin{document}
+
+\maketitle
+
+% Last edited to match Git commit a097bb2af5373e39f2f726747e2be72d693cae4b on manta main
+
+\begin{abstract}
+\noindent MANTA (Modular Aero-thermo-chemical Nonequilibrium Transport Architecture) is a compressible flow solver for hypersonic aerothermodynamics in thermal and chemical nonequilibrium, written in C++23 with MPI- and Kokkos-based parallelism. Its load-bearing design idea is \emph{one data model, two topology back-ends, shared kernel mathematics}: the conserved state is stored identically for structured curvilinear multi-block and arbitrary-polyhedral unstructured meshes, and every reconstruction, gradient, and flux kernel runs over a single cell range with no branch on cell type. Every physics model, numerical scheme, and I/O backend is a pluggable component selected at runtime from an input deck. This paper documents the solver -- governing equations, thermochemical and transport models, spatial and temporal discretisations, implicit numerics and preconditioning, turbulence closures, and the staggered photon-Monte-Carlo radiation subsystem -- and presents its verification and validation evidence, organised after the AIAA G-077 guide with discretisation-uncertainty estimation per ASME V\&V 20 and a credibility self-assessment against NASA-STD-7009B. The evidence -- spatial and temporal order of accuracy by the method of manufactured solutions, geometric and discrete conservation at round-off, quantified Jacobian consistency, an empirical and linearized robustness classification of every flux function, and a formal validation suite in which each case is driven from a freestream initial condition to a converged steady state and reports its comparison error against the ASME V\&V 20 validation uncertainty from a grid-triplet Grid Convergence Index -- is regenerated on every build by an automated suite of more than sixteen hundred tests. The tiered (inviscid, laminar viscous, turbulent, and flight-scale thermochemical-nonequilibrium) benchmarks illustrate the solver's correctness, robustness, and performance portability on CPU and GPU hardware.
+\end{abstract}
+
+\newpage
+
+\section*{Nomenclature}
+
+{\renewcommand\arraystretch{1.0}
+\noindent\begin{longtable*}{@{}l @{\quad=\quad} l@{}}
+$\U$ & vector of conserved variables \\
+$\rho,\ \rho_s$ & mixture density; partial density of species $s$, \unit{\kg\per\cubic\m} \\
+$\mathbf{u}=(u,v,w)$ & velocity, \unit{\m\per\s} \\
+$p$ & static pressure, \unit{\Pa} \\
+$T,\ T_{ve}$ & translational--rotational and vibrational--electronic temperature, \unit{\K} \\
+$E,\ e,\ e_{ve}$ & specific total, internal, and vibrational--electronic energy, \unit{\J\per\kg} \\
+$h_s$ & absolute (formation-inclusive) enthalpy of species $s$, \unit{\J\per\kg} \\
+$Y_s,\ X_s$ & mass and mole fraction of species $s$ \\
+$\mu,\ \kappa,\ D_s$ & viscosity, thermal conductivity, species diffusivity \\
+$\mu_t$ & turbulent (eddy) dynamic viscosity \\
+$\dot\omega_s$ & mass production rate of species $s$, \unit{\kg\per\cubic\m\per\s} \\
+$\mathbf{F},\ \hat{\mathbf{F}}$ & physical and numerical flux \\
+$\mathbf{S}$ & source-term vector \\
+$V_c,\ A_f,\ \nhat$ & cell volume, face area, outward unit normal \\
+$a$ & frozen speed of sound, \unit{\m\per\s} \\
+$M$ & Mach number \\
+$\gamma$ & ratio of specific heats \\
+$\tau_{ij}$ & viscous stress tensor \\
+$\hat p$ & observed order of accuracy \\
+$E_v,\ U_{\mathrm{val}}$ & validation comparison error and validation uncertainty (ASME V\&V 20) \\
+$\alpha$ & implicit shift supplied by PETSc \texttt{TS} \\
+\multicolumn{2}{@{}l}{Subscripts and superscripts}\\
+$L,R$ & left/right reconstructed face state \\
+$\infty$ & freestream condition \\
+$w$ & wall condition \\
+$\pm$ & positive/negative flux-vector split
+\end{longtable*}}
+\addtocounter{table}{-1}
+
+\newpage
+\section{Introduction}
+
+The aerothermodynamic design of hypersonic vehicles is governed by physics outside the reach of cold-gas, equilibrium aerodynamic analysis. Behind a strong bow shock, the gas excites molecular vibration, dissociates, and (at very high flight speeds) ionises; the relaxation times of these processes are commensurate with the flow residence time, so the gas is in thermal and chemical \emph{nonequilibrium}, and the surface heat flux, skin friction, and pressure that size a vehicle depend sensitively on how faithfully a solver represents that state~\cite{john_d_anderson_jr_hypersonic_2019}. Shock-boundary-layer interactions (SBLI) compound the difficulty: they induce localised, intense heating in separated flow that taxes both the spatial discretisation and the turbulence closure. Figure~\ref{fig:hero} shows the regime in miniature: dissociating two-temperature air over a cylinder, with the vibrational--electronic temperature lagging the translational--rotational temperature through the shock layer. This is precisely the nonequilibrium state this solver aims to capture.
+
+\begin{figure}[H]
+\centering
+\figplace{fig-hero-cylinder.png}{7cm}
+\caption{Hypersonic crossflow over a cylinder in dissociating air (Park
+two-temperature gas, five-species finite-rate chemistry): translational--rotational
+temperature $T$ (left) and vibrational--electronic temperature $T_{ve}$
+(right). The lag of $T_{ve}$ behind $T$ across the shock layer is the thermal
+nonequilibrium the solver targets.}
+\label{fig:hero}
+\end{figure}
+
+Production nonequilibrium solvers such as NASA's LAURA~\cite{thompson_laura_2024} and FUN3D~\cite{anderson_fun3d_2025} have established robust implicit finite-volume methods coupled to finite-rate thermochemistry as the workhorse for this regime. MANTA is a new solver in this lineage, written from the outset for GPU execution and modern HPC architectures, with three design goals. First, \emph{performance portability}: all field arrays are device-resident, and all kernels are expressed once through Kokkos -- compiling to CUDA, OpenMP, or serial back-ends. Second, \emph{modularity}: every physics model and numerical scheme is a runtime-selectable plugin, so a case is assembled -- gas model, transport, chemistry, turbulence closure, reconstruction, flux function, time integrator, preconditioner -- entirely from a YAML file. Third, \emph{implicit-first robustness}: time advancement is delegated to the PETSc \texttt{TS} library~\cite{usdoe_office_of_science_sc_advanced_scientific_computing_research_ascr_petsctao_2025}, so the stiff source terms of two-temperature relaxation and finite-rate chemistry, and the extreme cell aspect ratios of resolved hypersonic boundary layers, impose no explicit-stability step limit. The integrated EnzymeAD library~\cite{moses_instead_2020} permits automatic differentiation of the full residual to produce a consistent Jacobian for the implicit preconditioner, and the PETSc \texttt{SNES} nonlinear solver provides line-search and trust-region globalisation.
+
+Beyond assembling standard methods, the solver carries several artifacts of independent interest, each described where it arises and verified in Sec.~\ref{sec:vv}: a geometry-exact radial-basis TENO reconstruction~\cite{coveler_enhancing_2025} that recovers fifth order on arbitrarily stretched stencil geometry; an orbit-measure symmetry reduction whose geometric source is built from the discrete area-closure excess, so that well-balancing holds to round-off on \emph{any} mesh; an automatic-differentiation Jacobian tier -- exact flux, reconstruction, viscous-chain, and boundary-condition linearisations assembled on a wide stencil -- with a certified true-Newton pseudo-transient controller (PTC) that converges steady problems to machine zero; a joint empirical and linearized robustness classification of all fourteen flux functions, which separates carbuncle instability from nonlinear fragility and drove the redesign of the carbuncle correction; and a multiband-opacity-binning reduction of line-by-line spectra into transport-ready radiation tables.
+
+This paper is a technical report on the solver and its correctness evidence, intended as the citable description of the full-order model in subsequent verification, validation, and reduced-order-modelling studies. Section~\ref{sec:arch} describes the architecture; Sec.~\ref{sec:models} the physical models, from perfect gas through equilibrium air to two-temperature nonequilibrium with finite-rate chemistry and the turbulence closures; Sec.~\ref{sec:numerics} the spatial discretisation, implicit numerics, and Jacobian machinery; Sec.~\ref{sec:radiation} the radiation subsystem; and Sec.~\ref{sec:infra} boundary conditions, meshing, and output. Section~\ref{sec:vv}, the largest, presents the verification and validation campaign -- organised after the AIAA G-077 guide~\cite{noauthor_guide_1998} into code verification, solution verification, and validation, with numerical uncertainty per ASME V\&V 20~\cite{noauthor_standard_nodate} and a credibility assessment against NASA-STD-7009B~\cite{noauthor_nasa_nodate}. Throughout, the description is deliberately faithful to what the solver implements; capabilities that are \emph{partial} or \emph{planned} are flagged as such.
+
+\section{Solver Architecture}
+\label{sec:arch}
+
+MANTA is a cell-centred finite-volume solver. It is GPU-resident: all state lives in device memory, and the host participates only in I/O, initial-condition fill, and adaptation bookkeeping. Kokkos provides performance portability over shared-memory (CUDA, OpenMP, serial); GPU-aware MPI provides distributed-memory parallelism.
+
+\paragraph{One data model, two topology back-ends.}
+Every capability is implemented once against an abstract, unstructured-first data model; the structured curvilinear multi-block path is a performance optimisation, not a separate solver. \texttt{UnstructuredTopology} stores compressed-sparse-row (CSR) face adjacency and a once-built stencil table for polyhedral meshes; \texttt{StructuredTopology} exposes $ijk$ indexing, arithmetic stencils, and directional face loops that admit pencil sweeps, line-relaxation preconditioning, and transverse Gauss quadrature. A partition is a tagged union of the two, so the solver dispatches once on topology and is otherwise written against the shared abstraction, with geometric metrics (area vector, normal, centroid, volume) synthesised identically on both paths. Figure~\ref{fig:datamodel} sketches the arrangement.
+
+\begin{figure}[H]
+\centering
+\figplace{fig-data-model.pdf}{6.5cm}
+\caption{One data model, two topology back-ends. The conserved state is a
+flat structure-of-arrays indexed \texttt{data[var*nCells+cell]}; the
+structured $ijk$ and unstructured CSR topologies populate the same
+reconstruction--Riemann--flux kernel row, and ghost cells -- halo and
+boundary alike -- are ordinary cells in $[\,n_\mathrm{cellsOwned},
+n_\mathrm{cells})$, so no kernel branches on cell type or boundary
+proximity.}
+\label{fig:datamodel}
+\end{figure}
+
+\paragraph{State layout and ghost cells.}
+The conserved state is a flat, device-resident structure-of-arrays $(n_\mathrm{vars}\times n_\mathrm{cells})$, addressed \texttt{data[var*nCells+cell]} for coalesced GPU access, with variable indices resolved at runtime through a layout registry (flow, thermodynamic, species, and turbulence groups). Ghost cells -- halo and boundary alike -- are ordinary cells in the range $[\,n_\mathrm{cellsOwned}, n_\mathrm{cells})$: there are no sentinel indices or boundary branches in the flux loop, every boundary condition writes only its ghost cell, and the Riemann solver at a boundary face simply receives the (owner, ghost) pair. The two topologies differ only in how ghosts are populated -- arithmetic neighbour lookup (structured) or a halo manager (unstructured). At the linear-algebra seam, the state is transposed once between this structure-of-arrays (SoA) layout and the interlaced array-of-structures (AoS) point-block layout PETSc expects, so physics kernels and preconditioners each see their natural layout.
+
+\paragraph{Runtime factories.}
+Every model and scheme is a plugin selected from the YAML case file through an abstract base class and a registration factory: reconstructions, gradient computers, Riemann solvers, physics (gas, turbulence, ...) models, boundary and initial conditions, refinement sensors, preconditioners, and the radiation transport and spectral models each have a registry. Reconstruction and gradient schemes are written once against a stencil protocol and registered on both the structured and unstructured factories, so the same smoothness-indicator mathematics serves both paths.
+
+\paragraph{Distributed parallel execution.}
+Unstructured meshes are partitioned on the dual cell-adjacency graph by PT-Scotch~\cite{chevalier_pt-scotch_2008,satanas_scotch_2026}. Halo exchange overlaps communication with computation: non-blocking transfers are posted, interior-face flux work runs in their shadow, and the exchange is finalised before seam faces. With a GPU-aware MPI, device pointers pass directly; otherwise a pinned-buffer pool host-stages the messages.
+
+\section{Physical Models}
+\label{sec:models}
+
+\subsection{Governing equations}
+
+MANTA solves the compressible, multi-species Navier--Stokes equations in conservative form. For $N_s$ species,
+\begin{equation}
+\U = \big(\rho_1,\dots,\rho_{N_s},\ \rho u,\ \rho v,\ \rho w,\ \rho E\big)^{\!\top},
+\qquad
+\frac{\partial \U}{\partial t} + \divg\mathbf{F}^{\mathrm{inv}}(\U)
+= \divg\mathbf{F}^{\mathrm{vis}}(\U,\nabla\U) + \mathbf{S}(\U),
+\end{equation}
+with the standard inviscid flux, the Newtonian stress tensor
+$\tau_{ij}=\mu(\partial_j u_i + \partial_i u_j - \tfrac23\delta_{ij}\divg\mathbf{u})$, and a mass-corrected Fick diffusion model that enforces $\sum_s\rho_s\mathbf{V}_s=0$~\cite{giovangigli_multicomponent_1999},
+\begin{equation}
+\rho_s V_{s,j} = -\rho D_s \frac{\partial Y_s}{\partial x_j}
+ + Y_s \sum_{k=1}^{N_s} \rho D_k \frac{\partial Y_k}{\partial x_j},
+\qquad
+q_j = -\kappa\,\frac{\partial T}{\partial x_j} + \sum_s h_s\,\rho_s V_{s,j}.
+\end{equation}
+Because the diffusion fluxes carry no net mass, the diffusive-enthalpy term in $q_j$ is independent of the enthalpy datum and transports the formation enthalpy of dissociated atoms exactly~\cite{gnoffo_conservation_1989} -- the dominant heat-flux pathway to a cold catalytic wall in a dissociated hypersonic boundary layer.
+
+In the Park two-temperature model~\cite{park_nonequilibrium_1989}, the vibrational--electronic energy is an additional conserved variable governed by
+\begin{equation}
+\frac{\partial(\rho e_{ve})}{\partial t}
++ \divg\!\big[(\rho e_{ve}+p_{ve})\mathbf{u}\big]
+= \divg(\kappa_{ve}\nabla T_{ve})
+ - \divg\!\Big(\sum_s e_{ve,s}(T_{ve})\,\rho_s\mathbf{V}_s\Big)
+ + Q_{T\text{-}V} + \sum_s \dot\omega_s\,e_{ve,s},
+\end{equation}
+where $Q_{T\text{-}V}$ is the Landau--Teller relaxation source. The conduction and diffusive-enthalpy terms are transport fluxes entering both $\rho e_{ve}$ and $\rho E$; the Landau--Teller exchange is internal to $T\!\leftrightarrow\!T_{ve}$ and therefore absent from $\rho E$. For $N_s=1$, the species equations collapse to single-mixture continuity.
+
+\paragraph{A note on coordinate system reduction.}
+Axisymmetric and spherically symmetric problems run on plane meridian (or radial-column) meshes through an orbit-weighted reduction: cell volumes and face areas carry the sector or steradian measure of the suppressed directions, and the reduction's geometric momentum source $(p-\sigma_{\mathrm{hoop}})\,C_c/V_c$ is built from the \emph{discrete} closure excess $C_c=(\sum_f A_f\nhat_f)\cdot\hat{\mathbf{r}}$ rather than its analytic value, so that the $O(1)$ radial imbalance the weighted face fluxes leave on a uniform state is cancelled exactly on any mesh -- a well-balancing property verified to machine precision in Sec.~\ref{sec:vv-conservation}. The formulation is reduction-generic: the spherical case reuses the axisymmetric source unchanged, and the source Jacobian carries the pressure part $(C_c/V_c)\,\partial p/\partial\U$ exactly for the implicit path. This symbol-less writing of the foundational equations permits arbitrary orbit measures or even entire coordinate systems for V\&V purposes (for instance, a toroidal reduction) without changing the solver's core.
+
+\subsection{Gas models}
+
+Five gas models are provided. The default \emph{calorically perfect} model uses $p=(\gamma-1)\rho e$ with configurable $\gamma$, $R=\qty{287.058}{\J\per\kg\per\K}$. The \emph{thermally perfect} model evaluates each species' $c_p$, $h$, and $s$ from the NASA nine-coefficient polynomials over three temperature ranges~\cite{mcbride_nasa_2002,mcbride_coefficients_1993}, mixes by mass fraction, and recovers temperature from internal energy by Newton iteration (tolerance $|\Delta T|<10^{-6}T$, clamp $T\in[50,5\times10^4]\,\unit{\K}$, three to ten iterations in practice). Built-in species cover the Park air sets and a GRI-derived combustion set~\cite{gregory_p_smith_gri-mech_nodate}.
+
+Two \emph{equilibrium-air} models provide the local-thermodynamic-equilibrium limit between the perfect-gas and finite-rate tiers. The first evaluates the Srinivasan--Tannehill--Weilmuenster curve fits of NASA RP-1181 directly~\cite{srinivasan_simplified_1987}, with analytic Jacobian data for the implicit path. The second is table-driven: at setup, a Gibbs-free-energy minimiser -- element potentials over the same NASA-9 polynomials, Newton on the dual potentials with a Tikhonov-regularised symmetric solve -- computes the equilibrium composition of an arbitrary reactant mixture (default twelve-species air including ions, equivalent to NASA-9 plus argon), and tabulates the equation of state and transport coefficients on a $(\log\rho,\log e)$ grid that the flow solver interpolates. The fits, the minimiser, and the table cross-verify against one another, against NASA CEA, and against the LAURA reference implementation (Sec.~\ref{sec:vv-chem}). 
+
+The \emph{Park two-temperature} gas models~\cite{park_nonequilibrium_1989,park_review_1993} provide high-fidelity finite-rate chemistry (Sec.\ref{sec:chem}) and vibrational--electronic energy: each diatomic carries a simple-harmonic-oscillator vibrational mode ($\theta_v=\{3395,2273,2817\}\,\unit{\K}$ for \ce{N2}, \ce{O2}, \ce{NO}), pressure follows the translational temperature, and the sound speed uses the frozen ratio of specific heats. The Landau--Teller source combines the Millikan--White relaxation time~\cite{millikan_systematics_1963} with Park's high-temperature limiting cross-section~\cite{park_review_1993} ($\sigma_v'=\qty{3e-21}{\m\squared}$).
+
+\subsection{Transport models}
+
+For single-species air, the default is Sutherland's law with $\kappa=\mu c_p/Pr$, $Pr=0.72$~\cite{sutherland_viscosity_1893,white_viscous_2005}. For neutral reacting air (for instance, a Park5 run), a Blottner--Eucken--Wilke model applies the Blottner viscosity curve fits~\cite{blottner_chemically_1971}, an energy-mode-split Eucken conductivity~\cite{eucken_uber_1913,svehla_estimated_1963}, and Wilke mixing~\cite{wilke_viscosity_1950}; species diffusion closes with a constant Lewis number (default $\mathrm{Le}=1.4$). Soret and Dufour effects and Stefan--Maxwell diffusion are not modelled.
+
+For ionising 5/7/11-species air, the mixture coefficients are instead built from binary collision integrals through the Gupta--Yos closure of NASA RP-1232~\cite{gupta_review_1990}: curve-fit $\pi\bar\Omega^{(l,s)}_{ij}(T)$ integrals (Coulomb pairs scaling as $T^{-2}$, distinct resonant charge-exchange fits) feed the Yos mixture viscosity and translational conductivity, an internal-energy conductivity, and a Curtiss--Hirschfelder mixture diffusivity~\cite{giovangigli_multicomponent_1999}. With electrons present, quasi-neutrality imposes ambipolar diffusion ($D_i^a=2D_i$, the electron diffusivity ion-mass-averaged so ions and electrons carry zero net current), and charged-pair integrals carry a Debye-screened Coulomb logarithm evaluated at the local electron pressure~\cite{gnoffo_conservation_1989}. The closure assumes quasi-neutrality (no sheath physics) and a single electron temperature $T_e=T_v$. The model reproduces the RP-1232 single-species fits in the pure limit. The equilibrium-air gas models carry matching transport tiers -- NASA TM-104107 equilibrium-air viscosity and conductivity curve fits, or the tabulated model's own transport columns -- and a host-side physics-consistency gate enforces valid gas/transport/chemistry pairings at setup.
+
+\subsection{Finite-rate chemistry}
+\label{sec:chem}
+
+Two finite-rate Park air mechanisms share one mechanism-generic kernel: \emph{Park-5} (\ce{N2}, \ce{O2}, \ce{NO}, \ce{N}, \ce{O}; five reactions) for neutral dissociating air~\cite{park_nonequilibrium_1989}, and \emph{Park-11}, which adds \ce{N+}, \ce{O+}, \ce{NO+}, \ce{N2+}, \ce{O2+}, and \ce{e-} with the full Park/Gnoffo reaction set -- associative ionisation, electron-impact ionisation and dissociation, and the charge-exchange ladder -- for ionising air above roughly \qty{7}{\km\per\s}~\cite{park_review_1993,park_assessment_1989,gnoffo_conservation_1989}. Forward rates are Arrhenius; backward rates enforce detailed balance through the Gibbs-energy equilibrium constant~\cite{mcbride_computer_1996},
+\begin{equation}
+k_b(T)=k_f(T)/K_c(T),\qquad
+K_c=\exp\!\Big(\sum_s\nu_{r,s}\big[s_s/R_u - h_s/(R_u T)\big]\Big)\Big(\frac{p_{\mathrm{ref}}}{R_u T}\Big)^{\Delta\nu_r},
+\end{equation}
+where the Gibbs energies are taken from the \emph{same} NASA-9 polynomials that drive the equation of state, so chemical equilibrium coincides with the gas model's entropy maximum validated against NASA CEA~\cite{noauthor_nasacea_2026} by construction. In the two-temperature path, each forward rate is evaluated at the Park controlling temperature $T_c=T_{tr}^{\,s_r}T_v^{\,1-s_r}$ ($s_r=\half$ for heavy-body dissociation, $1$ for exchange and ionisation, $0$ for electron-impact dissociation), the backward rate retains $T_{tr}$ so detailed balance is exact at $T_v=T_{tr}$, and dissociating molecules draw a fraction $\alpha_d=0.3$ of their bond energy from the vibrational mode. The stiff species-block source Jacobian is assembled by finite difference in mass-fraction space; the kernel additionally exposes split forward/backward molar rates and a frozen-rate Jacobian so that partially-stirred-reactor and eddy-dissipation-concept turbulence--chemistry closures can scale the mean source without re-deriving the kinetics.
+
+At a catalytic wall, the same kinetics close the surface boundary condition: a partial $\gamma$-model balances the wall-normal diffusive atom flux against kinetic recombination through a Damk\"ohler number,
+
+\begin{equation}
+(\rho Y_A)_g=(\rho Y_A)_i\,\frac{1-\mathrm{Da}_A}{1+\mathrm{Da}_A},
+\qquad \mathrm{Da}_A=\frac{\gamma_A\sqrt{R_A T_w/(2\pi)}\,\delta}{D_A},
+\end{equation}
+
+recovering the fully- and non-catalytic limits as $\gamma_A\to1,0$ with one homonuclear channel per atom~\cite{wright_data_2009}.
+
+\subsection{Turbulence closures}
+\label{sec:turb}
+
+A single closure interface serves RANS, LES, and hybrid models. The RANS set comprises Spalart--Allmaras (with all sensor functions differentiated for the implicit diagonal source Jacobian, verified against central differences)~\cite{spalart_one-equation_1992}; Menter SST $k$--$\omega$ with the $F_1$ blending and shear-stress-limited eddy viscosity~\cite{menter_two-equation_1994,wilcox_turbulence_2006}, plus the vorticity-production SST-V variant that suppresses stagnation-point energy build-up~\cite{menter_ten_2003}; the 2024--2025 GEKO revision, whose independent coefficients tune separation, near-wall, free-shear, and jet behaviour without disturbing the wall calibration~\cite{menter_generalized_2025}; and the Launder--Reece--Rodi Reynolds-stress closure for anisotropy under strong curvature and three-dimensional separation~\cite{launder_progress_1975}. The LES set comprises WALE (correct near-wall cubic scaling without a wall distance)~\cite{nicoud_subgrid-scale_1999}, classical Smagorinsky--Lilly~\cite{smagorinsky_general_1963,lilly_application_1966}, and a dynamic one-equation subgrid model with a Germano-identity coefficient~\cite{kim_new_1995,germano_dynamic_1991}. The hybrid SA-IDDES model reuses the SA transport equation with a hybrid length scale -- RANS in attached boundary layers, wall-modelled LES on resolved near-wall grids, LES in separated regions~\cite{shur_hybrid_2008,spalart_new_2006}. Turbulent heat and species fluxes close with turbulent Prandtl and Schmidt numbers ($Pr_t=0.9$, $Sc_t=0.7$ by default), with an optional Kays--Crawford correlation for the near-wall rise in $Pr_t$~\cite{kays_turbulent_1994,kays_convective_2005}. This menu of closures is validated against canonical benchmarks in Sec.~\ref{sec:vv}, and provides a testbed to independently reproduce SBLI capture and separation studies~\cite{maclean_ground_2008, wadhams_ground_2008}.
+
+\section{Numerical Methods}
+\label{sec:numerics}
+
+\subsection{Finite-volume formulation}
+
+Integrating the conservation law over a cell and applying the divergence theorem gives the semi-discrete system:
+
+\begin{equation}
+V_i\,\frac{\mathrm{d}\U_i}{\mathrm{d}t}
+= -\sum_{f\in\partial V_i}\hat{\mathbf{F}}_f\,A_f + V_i\,\mathbf{S}_i.
+\label{eq:semidiscrete}
+\end{equation}
+
+The structured path loops over the $(\xi,\eta,\zeta)$ directions and the unstructured path over a CSR face list; the per-face computation is identical. Left and right face states are obtained by reconstruction and passed to the selected Riemann solver. Metrics are synthesised identically on both paths -- a Newell area vector and a pyramid-decomposition volume for arbitrary polyhedra. On structured faces, the flux integral may be raised to a tensor-product Gauss--Legendre rule of up to three nodes per tangent axis (the default single node is byte-identical to a midpoint sweep); the unstructured path integrates at the face centroid only. \emph{This face quadrature -- not the reconstruction -- is what caps the assembled spatial operator at second order for general multidimensional flow}, a property Sec.~\ref{sec:vv} measures rather than assumes.
+
+Cell-centre gradients feed the viscous fluxes and higher-order reconstruction. The menu mirrors production practice: plain and distance-weighted Green--Gauss, an inverse-distance-weighted least-squares operator with the mesh-only normal matrix precomputed (linearity-exact on any mesh, recommended for wall gradients~\cite{barth_design_1989,venkatakrishnan_application_1989,mavriplis_revisiting_2003}), node-based Green--Gauss and least-squares variants with linearity-preserving Holmes--Connell weights~\cite{holmes_solution_1989} (seam-node neighbourhoods sum-reduced across MPI ranks and blocks), and a structured-only fourth-order central operator on uniform blocks.
+
+\subsection{Riemann and flux functions}
+
+MANTA implements the fourteen flux functions of Table~\ref{tab:riemann} behind a single explicit contract; the assembled implicit Jacobian is built separately -- by default an approximate Steger--Warming split independent of the flux choice, or an exact derivative of whichever flux is selected (Sec.~\ref{sec:jacobian}) by Enzyme auto-differentiation. The two-wave HLL family~\cite{harten_high_1983} differs only in wave-speed estimate (Davis bounds~\cite{davis_simplified_1988}; Einfeldt's positivity-preserving Roe-averaged speeds~\cite{einfeldt_godunov-type_1988,einfeldt_godunov-type_1991}); HLLEM restores the linearly degenerate fields by a Dumbser--Balsara projection~\cite{dumbser_new_2016} and HLLC restores the contact wave~\cite{toro_restoration_1994}. Low-Mach variants rescale the normal-velocity jump by a Mach sensor to remove spurious acoustic dissipation as $M\to0$~\cite{rieper_low-mach_2011,thornber_improved_2008,fleischmann_shock-stable_2020}, and AUSM$^+$-up splits convective and pressure parts for all-speed accuracy~\cite{liou_sequel_1996,liou_sequel_2006}. The Roe solver carries a Harten entropy fix~\cite{roe_approximate_1997}, Rusanov is the maximally robust baseline~\cite{rusanov_calculation_1962}, and an entropy-stable flux pairs Chandrashekar's kinetic-energy-preserving two-point flux~\cite{chandrashekar_kinetic_2013} with Ismail--Roe/Winters matrix dissipation~\cite{ismail_affordable_2009,winters_affordable_2016} for a discrete entropy inequality at far lower contact dissipation than scalar Lax--Friedrichs. An iterative exact Godunov solver~\cite{toro_riemann_2009} completes the set as the zero-model-error reference against which the robustness classification of Sec.~\ref{sec:vv-robust} is measured.
+
+Three solvers target the carbuncle instability and positivity at strong hypersonic shocks. Rotated-RHLL~\cite{nishikawa_very_2008,ren_robust_2003} decomposes the face normal into a shock-normal direction (dissipative HLLE) and a transverse direction (low-dissipation Roe), collapsing to a Roe flux with modified wave speeds. The Bouchut three-wave solver replaces the pressure law with the linearly degenerate Suliciu relaxation system~\cite{suliciu_modelling_1990,chalons_relaxation_2008}, whose Riemann problem is solved exactly and which is \emph{provably positive} for arbitrarily strong shocks under the subcharacteristic condition~\cite{bouchut_nonlinear_2004}; the rotated-Bouchut variant combines carbuncle resistance with that positivity guarantee at the cost of two flux evaluations per face. All shock-capturing reconstructions operate on local characteristic variables built from the mean acoustic impedance of the face-adjacent states; passive scalars are reconstructed directly.
+
+\begin{table}[H]
+\centering
+\caption{Riemann and flux functions. The default assembled Jacobian is a
+uniform Steger--Warming split independent of the flux choice; the
+automatic-differentiation tier of Sec.~\ref{sec:jacobian} differentiates the
+selected flux exactly.}
+\label{tab:riemann}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Key & Family & Distinguishing feature \\
+\midrule
+\texttt{hll} & two-wave HLL & Davis wave-speed bounds \\
+\texttt{hlle} & two-wave HLL & Einfeldt speeds, positivity-preserving \\
+\texttt{hlle\_lm} & HLL low-Mach & normal-momentum jump rescaled \\
+\texttt{hllem} & HLL + projection & contact/shear anti-diffusion (carbuncle-prone) \\
+\texttt{hllc} & HLL + contact wave & exact contact resolution \\
+\texttt{hllc\_lm} & HLLC low-Mach & shock-stable all-speed correction \\
+\texttt{ausm\_plus\_up} & AUSM family & all-speed convective/pressure split \\
+\texttt{roe} & flux-difference & Roe average + Harten entropy fix \\
+\texttt{rusanov} & local Lax--Friedrichs & maximally robust baseline \\
+\texttt{entropy\_stable} & EC + matrix dissipation & discrete entropy inequality \\
+\texttt{rotated\_rhll} & rotated hybrid HLLE/Roe & carbuncle-free, BL-resolving \\
+\texttt{bouchut3} & Suliciu relaxation & provably positive intermediate states \\
+\texttt{rotated\_bouchut} & rotated HLLE/Bouchut & carbuncle-free + positive \\
+\texttt{exact} & iterative Godunov & zero-model-error reference solver \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{High-order reconstruction}
+\label{sec:recon}
+
+Reconstruction maps cell averages to face states. The minmod-limited MUSCL scheme~\cite{van_leer_towards_1979} is the second-order shock-capturing baseline. Fifth-order accuracy is provided by Jiang--Shu WENO5~\cite{jiang_efficient_1996,shu_efficient_1988} and its critical-point-corrected WENO5-Z variant~\cite{borges_improved_2008}, and by the TENO family~\cite{fu_family_2016,fu_review_2023}, which replaces smooth weighting with a sharp binary cutoff on a scale-independent sensor: candidate sub-stencils are fully retained or discarded before optimal-weight recombination, giving complete stencil de-selection across discontinuities while preserving the low-dissipation full stencil in smooth turbulence. TENO5-A adapts the cutoff threshold locally~\cite{fu_very-high-order_2019}. TENO5-RBF derives per-face sub-stencil weights from a polyharmonic-spline radial-basis interpolation of the cell averages on the face-normal projection of the \emph{actual} stencil geometry~\cite{coveler_enhancing_2025}: with full quadratic monomial augmentation, the saddle system collapses to the unique geometry-exact polynomial reconstruction, recovering fifth order on arbitrarily stretched projected geometry and reducing exactly to classical TENO5 on a uniform grid. A non-dissipative fourth-order central scheme~\cite{leveque_finite_2002} is provided for DNS/LES of smooth turbulence, and a startup decorator blends from first order during cold-start without relaxing the converged discretisation~\cite{richtmyer_proposed_1948}.
+
+\subsection{Implicit time integration}
+\label{sec:temporal}
+
+MANTA is implicit-first. The production integrator is PETSc \texttt{TS} BDF2~\cite{hairer_solving_1996}, with backward Euler as startup fallback, a stiffly accurate third-order ESDIRK (\texttt{es324sal}) as alternative, and explicit SSP-RK3~\cite{gottlieb_strong_2001} retained for verification. At each step, PETSc solves the shifted system $(\alpha M - \partial\mathbf{R}/\partial\U)\,\delta\U = -\mathbf{G}(\U)$ with the shift $\alpha$ supplied by \texttt{TS}, model-independent across BDF2, backward Euler, or each DIRK stage. The Krylov operator is the PETSc matrix-free finite-difference Jacobian (Jacobian-free Newton-Krylov, or JFNK), which differences the full nonlinear residual -- so the exact linearisation of whichever flux is active is captured without per-solver Jacobian code -- with the Walker--Pernice step~\cite{pernice_nitsol_1998,dennis_numerical_1996}
+\begin{equation}
+h=\frac{\varepsilon_{\mathrm{rel}}\sqrt{1+\lVert\U\rVert_2}}{\lVert\mathbf{x}\rVert_2}
+\end{equation}
+scaled by both the state and the Krylov direction, holding the perturbation above round-off across the many-decade dynamic range of dimensional hypersonic states. When the assembled operator of Sec.~\ref{sec:jacobian} is exact for the active configuration, it can instead serve as the Krylov operator directly, replacing the matrix-free differencing and permitting even faster convergence at the cost of more memory.
+
+\subsection{Jacobian assembly: approximate splits and exact automatic differentiation}
+\label{sec:jacobian}
+
+The assembled matrix is, by default, a preconditioner-grade approximation on the compact nearest-neighbour stencil. Its convective part is a unified Steger--Warming split~\cite{steger_flux_1981} over the whole conserved vector, following the DPLR family~\cite{maccormack_solution_1989,wright_data-parallel_1998}, evaluated from Frobenius covariants with a Harten entropy fix, with a Roe-matrix linearisation as the alternative; the block-diagonal source Jacobian (two-temperature relaxation, chemistry, turbulence) is added on the cell diagonal, roughly halving the Krylov count on vibration-stiff solves. This tier is deliberately approximate in three ways -- the split is not the derivative of the selected flux, the first-order stencil is not the derivative of the high-order residual, and boundary rows close with a ghost-equals-owner response -- and each of those distances is measured, not assumed, in Sec.~\ref{sec:vv-jac}.
+
+When exactness is wanted, an automatic-differentiation tier assembles the true Jacobian of the discrete residual. In builds carrying the Enzyme LLVM plugin~\cite{moses_instead_2020, moses_reverse-mode_2021, moses_scalable_2022}, forward-mode passes differentiate the \emph{actual} pointwise kernels -- no hand linearisation, and nothing to re-derive when a model is swapped: the selected Riemann flux ($\partial\hat{\mathbf{F}}/\partial\U_{L,R}$ of whichever entry of Table~\ref{tab:riemann} is active), the MUSCL reconstruction (differentiated live through the limiter seam, or replayed frozen from recorded face states), the full viscous chain -- the face gradients' dependence on every stencil cell carried exactly through a reified sparse gradient operator -- and each nonlinear boundary condition's ghost response (no-slip wall, farfield, subsonic inflow and outflow; linear conditions are filled analytically). A wide-stencil sparsity pattern chains the per-face flux blocks through the reconstruction and gradient adjacency into an interlaced block-COO fill -- a 13-point star per row for MUSCL, growing further for 5-point stencils -- and boundary ghost columns are folded algebraically onto their interior donors, so boundary rows are exact rather than approximated. Every row of the resulting operator matches Fr\'echet derivatives of the residual, inviscid and viscous alike (Sec.~\ref{sec:vv-jac}); the same AD blocks cross-check the finite-difference Jacobians of the robustness analysis of Sec.~\ref{sec:vv-robust} and price each flux function's conditioning toward vacuum. Figure~\ref{fig:spy} contrasts the two sparsity patterns on a small mesh.
+
+\begin{figure}[H]
+\centering
+\figplace{fig-jacobian-spy.pdf}{5.5cm}
+\caption{Assembled-Jacobian sparsity on a small mesh: the compact
+nearest-neighbour pattern of the approximate split (left) against the wide
+13-point MUSCL star of the AD-exact operator (right), whose extra bands carry
+the reconstruction and gradient couplings the compact tier freezes.}
+\label{fig:spy}
+\end{figure}
+
+The shifted operator is preconditioned by topology. The structured default is alternating-direction (Beam--Warming) line relaxation~\cite{beam_implicit_1976,pulliam_diagonal_1981} -- three block-tridiagonal sweeps solved exactly by block Thomas -- with an opt-in DPLR plugin~\cite{wright_data-parallel_1998} that treats the stiff wall-normal direction exactly and relaxes cross-stream couplings by multi-coloured Gauss--Seidel~\cite{yoon_lower-upper_1988}. The unstructured default is PETSc ILU(0), with a setup-free multicolour LU-SGS smoother~\cite{yoon_lower-upper_1988,sharov_reordering_1998} whose greedy colouring makes each colour update race-free; algebraic multigrid (GAMG as unsmoothed aggregation~\cite{briggs_algebraic_2000,cleary_robustness_2000}) and the GPU-portable PETSc back-end~\cite{mills_toward_2021} are also available.
+
+\subsection{Pseudo-transient continuation and the true Newton solve}
+\label{sec:ptc}
+
+Steady-state runs use pseudo-transient continuation~\cite{mulder_experiments_1985,crivellini_implicit_2011}: a linear CFL ramp followed by a switched-evolution-relaxation update that grows the pseudo-step against the residual history: 
+
+\begin{equation}
+\Delta\tau^{n+1}=\Delta\tau^{n}\,\mathrm{clamp}[(\lVert\mathbf{R}^{n-1}\rVert/\lVert\mathbf{R}^{n}\rVert)^{\alpha},0.1,10]
+\end{equation}
+
+with per-cell local pseudo-timestepping available for boundary-layer-stiff cases. Convergence is declared per governing-equation group (continuity, momentum, energy, vibrational, species, turbulence), each normalised by its running maximum so the large-magnitude energy residual cannot mask an unconverged continuity or turbulence equation. A full-approximation-scheme nonlinear multigrid initialiser on agglomerated coarse levels~\cite{brandt_multi-level_1977,mavriplis_convergence_1998} provides a startable cold-start field, with a $\tau$-correction that leaves an already-converged fine field exactly fixed.
+
+The exact operator changes what pseudo-time can do. At setup, the assembler \emph{certifies} whether the assembled Jacobian is exact for the active configuration -- wide stencil, AD convective and viscous blocks, every boundary row claimed by an exact ghost response, no frozen couplings -- and when it is, the controller enters a true-Newton mode: once the residual crosses a threshold, it stops throttling by the SER/CFL heuristic and grows the pseudo-step geometrically toward the Newton limit, backing off and cooling down on a failed solve so that the approach is a continuation in the shift rather than a cliff. Certified steady problems converge to machine zero in a handful of terminal iterations; an uncertified configuration simply retains the classical SER dynamics. Figure~\ref{fig:endgame} shows the signature on an exemplar viscous case: the SER-throttled history plateaus at its heuristic floor, while the true-Newton solve's geometric pseudo-step growth turns the same solve into a terminal drop.
+
+\begin{figure}[H]
+\centering
+\figplace{fig-newton-endgame.pdf}{6cm}
+\caption{Steady-state residual history with classical switched-evolution
+relaxation (SER) throttling against the certified true-Newton endgame on the
+same case: once the residual crosses the switch threshold the endgame grows
+the pseudo-step geometrically toward the Newton limit and converges to
+machine zero in a handful of terminal iterations.}
+\label{fig:endgame}
+\end{figure}
+
+\subsection{Robustness and limiting}
+\label{sec:robust}
+
+Positivity is guarded by density and pressure floors (defaults $\rho_{\min}=\qty{e-8}{\kg\per\cubic\m}$, $p_{\min}=\qty{e-3}{\Pa}$) applied in a minimum-correction, velocity-preserving fix at both the reconstructed face and the updated cell; transported turbulence scalars carry analogous realizability bounds ($k\ge0$, $\omega\ge\omega_{\mathrm{floor}}>0$, an eddy-viscosity-ratio cap). On grid-aligned strong shocks, the contact-resolving solvers may be protected by an opt-in multidimensional H-correction~\cite{sanders_multidimensional_1998}: a cell-based compressive-shock sensor (silent on shear and rarefactions) injects only the \emph{excess} transverse Rusanov dissipation on shock-parallel faces -- where the odd--even carbuncle mode actually grows -- and leaves shock-normal faces untouched. The correction was redesigned from a face-local pressure blend after the V\&V suite's linearized stability analysis showed the original sensor silent on exactly the faces that carry the instability; both the diagnosis and the fix are gated in Sec.~\ref{sec:vv-robust}. The rotated and Bouchut solvers address the carbuncle structurally. For steady boundary-layer runs a cell-aspect-ratio scaling lifts each cell's local pseudo-step by its directional aspect ratio (capped), and the step diagnostics report both the convective Courant number and the viscous von~Neumann number so a diffusion-limited regime is visible rather than silent.
+
+\section{Radiation Transport}
+\label{sec:radiation}
+
+At atmospheric entry velocities, the shock layer radiates strongly, and radiative cooling can rival convective heating at the stagnation point~\cite{johnston_nonequilibrium_2008}. MANTA's radiation subsystem is factored into two independently selectable axes: a \emph{spectral} model supplying per-band emission $j_b$ and absorption $\kappa_b$, and a \emph{transport} model determining how much of that emission escapes, is reabsorbed, or reaches a wall. Along a path the intensity obeys the radiative transfer equation for a non-scattering medium, whose exact formal solution across a homogeneous segment:
+
+\begin{equation}
+I_\nu^{\mathrm{out}}=I_\nu^{\mathrm{in}}e^{-\kappa_\nu\Delta s}+({j_\nu}/{\kappa_\nu})(1-e^{-\kappa_\nu\Delta s})
+\end{equation}
+
+is the building block of both the transport tiers and their verification. The radiative source enters the total (and, in a two-temperature solve, vibrational--electronic) energy equation as $-\divg\mathbf{q}_{\mathrm{rad}}$; in the optically thin limit, reabsorption is dropped and the source collapses to the local band-summed emission -- the one term for which $\rho E$ is deliberately \emph{not} conserved.
+
+\paragraph{Spectral models.}
+A grey tier and a synthetic multiband tier exercise the band machinery; the production tier interpolates an opacity table reduced offline from NEQAIR line-by-line air spectra~\cite{johnston_spectrum_2008,lopez_spark_2016}, storing mass-specific emission and absorption coefficients per species and band on a $(T_{tr},T_{ve})$ grid, recombined at runtime from the partial densities. The offline reduction is multiband opacity binning (MBOB), not a single grey opacity per band: a grey band smears strong-line absorption and renders the line-rich vacuum-ultraviolet optically thick, collapsing its emergent radiance. MBOB splits each band into bins by the \emph{magnitude} of $\kappa_\eta$ on globally fixed log-spaced thresholds, storing the source-weighted mean opacity
+\begin{equation}
+\bar\kappa_{b,g}=\frac{\int_{(b,g)} j_\eta\,\mathrm{d}\eta}{\int_{(b,g)}(j_\eta/\kappa_\eta)\,\mathrm{d}\eta}
+\end{equation}
+that preserves the in-band opacity distribution~\cite{hirata_improvement_2014}; each bin is downstream just another band, so the transport solver is unchanged. Figure~\ref{fig:mbob} illustrates the construction on a line spectrum.
+
+\begin{figure}[t]
+\centering
+\figplace{fig-mbob-binning.pdf}{5.5cm}
+\caption{Multiband opacity binning. A line spectrum within one wavelength
+band (top) is partitioned by opacity magnitude on fixed log-spaced thresholds
+(colours); each bin stores a source-weighted mean opacity and travels through
+the transport solver as its own grey band. A single emission-weighted grey
+opacity (bottom) smears the strong-line absorption across the whole band,
+rendering the line-rich vacuum-ultraviolet uniformly thick and collapsing its
+emergent radiance.}
+\label{fig:mbob}
+\end{figure}
+
+\paragraph{Photon Monte Carlo transport.}
+The participating-media tier resolves reabsorption by a deterministic, energy-conserving photon Monte Carlo: per band, each cell emits equal-energy bundles in isotropic directions from a counter-based RNG keyed by the global cell identifier (paths are reproducible independent of the partition), marched cell-to-cell with analytic per-segment deposition and attenuation. The estimator is unbiased with error $\propto N_p^{-1/2}$. Because the dense stochastic radiative Jacobian is incompatible with the sparse flow Jacobian, the source is \emph{lagged}: a producer traces rays on the converged state at a set cadence and caches a frozen source that a cheap applier adds to every residual, converging to the same steady fixed point as tight coupling. Ray tracing is parallelised by optical-domain replication decoupled from the flow decomposition -- each rank traces its own photons against the gathered global geometry and partial fields are all-reduced, a rank-count-invariant result. When the tracer is active, boundaries join the photon field as grey, diffuse, opaque surfaces: a face of emissivity $\varepsilon_f$ emits $\varepsilon_f\sigma T_w^4 A_f$ (band-partitioned by the blackbody fraction), absorbs the fraction $\varepsilon_f$ of incident power, and reflects the complement diffusely, closing the radiative-equilibrium wall balance. Independently of the stochastic tracer, the spectral tier is exercised by a deterministic tangent-slab reduction -- the same one-dimensional geometry NEQAIR runs -- so a discrepancy against a line-by-line reference isolates the spectral table's error from the flowfield's (Sec.~\ref{sec:vv-rad}).
+
+\section{Boundary Conditions, Meshing, and Output}
+\label{sec:infra}
+
+\paragraph{Boundary and initial conditions.}
+All boundary conditions are ghost-cell implementations. The no-slip wall reflects the interior velocity with adiabatic, isothermal, or radiative-equilibrium thermal modes -- the last solving $\varepsilon\sigma T_w^4=\kappa(T_i-T_w)/\Delta n$ by Newton--Raphson -- and carries the catalytic $\gamma$-model of Sec.~\ref{sec:chem}. Symmetry/slip walls mirror momentum; supersonic inflow/outflow prescribe or extrapolate; subsonic and unified farfield conditions branch on the local normal Mach number using Riemann invariants with total-condition or back-pressure closures~\cite{poinsot_boundary_1992}. A transpiration condition supports receptivity studies~\cite{fedorov_transition_2011}, translational periodicity is handled at the connectivity level, and the two-temperature path stamps equilibrium vibrational energy at inflows. Initial conditions are a uniform freestream, a per-cell expression of the centroid coordinates, or a piecewise predicate-guarded fill, with the optional full-multigrid cold start as in Sec.~\ref{sec:ptc}.
+
+\paragraph{Mesh formats and partitioning.}
+MANTA reads CGNS-HDF5 (structured blocks or face-based polyhedral zones)~\cite{poirier_cgns_1998,hauser_parallel_2004}, Fluent CFF polyhedral HDF5~\cite{noauthor_fluent_nodate}, and Gmsh MSH~4.1~\cite{geuzaine_gmsh_2009} external formats. It also contains a comprehensive suite of in-house meshing algorithms, including uniform-Cartesian, semi-auto-blocked curvilinear-block-structured, and arbitrary-polyhedral constrained-Voronoi-tesselation/restricted-Delaunay fill algorithms. All of these are wrapped behind a single interface and share a common tagging/condition-binding model, so a single input deck can drive any mesh format behind the abstraction layer.
+
+Unstructured meshes are partitioned by PT-Scotch on the dual graph; structured multi-block meshes by whole-block round-robin or longest-axis greedy bisection, with intra-zone interface pairs emitted so intra- and inter-zone halo exchange are identical. The adaptive path uses a family-atomic space-filling-curve partition over a replicated refinement forest, so every collective is a deterministic function of the forest keys and checkpoint/restart works on any rank count~\cite{warren_parallel_1993,burstedde_p4est_2011}.
+
+\paragraph{Adaptive mesh refinement.}
+MANTA performs conservative cell-based $h$-refinement on a 2:1-balanced forest over the base mesh~\cite{berger_local_1989,burstedde_p4est_2011}. A marking pass combines sensors by pointwise maximum, applies hysteresis, and dilates the refined band as a moving-feature margin, optionally under a global cell budget; the dimensionless L\"ohner second-derivative sensor~\cite{lohner_adaptive_1987} and an expression sensor (doubling as region forcing) are built in. State transfer is a single SFC merge walk -- copy on equal keys, prolong by injection, restrict by the volume-weighted mean, exactly conservative. Hexahedra subdivide on the trilinear corner lattice; general polyhedra refine through a vertex macro split into dyadic hexes~\cite{catmull_recursively_1978}. A distributed adapt event performs seam-symmetric balancing, a bitwise-identical plan allgather, rank-local transfer, and an SFC re-cut, giving serial/parallel residual equivalence to round-off. The structured path instead adapts by block tiles consumed directly by the ADI/DPLR preconditioners, with single-rate refluxing restoring conservation at coarse-fine seams~\cite{grete_parthenonperformance_2023}.
+
+\paragraph{Output and surface quantities.}
+Snapshots are written in VTKHDF with full polyhedral connectivity and collective MPI-IO; a separate HDF5 checkpoint stores the conservative state and refinement forest, validates a mesh checksum on restart, and supports any rank count. Wall patches are extracted as a surface series reporting
+\begin{equation}
+C_p=\frac{p-p_\infty}{\half\rho_\infty V_\infty^2},\quad
+C_f=\frac{\lVert\boldsymbol\tau_w\rVert}{\half\rho_\infty V_\infty^2},\quad
+\mathrm{St}=\frac{q_w}{\rho_\infty V_\infty c_{p,\infty}(T_{0,\infty}-T_w)},\quad
+y^+=\frac{\rho_w u_\tau\,\Delta n}{\mu_w}.
+\end{equation}
+
+\section{Verification and Validation}
+\label{sec:vv}
+
+\subsection{Framework and provenance}
+
+Verification and validation are continuous activities embedded in the automated test suite: every order-of-accuracy study, conservation check, and benchmark comparison below is an assertion that runs on every change, so the evidence is regenerated on each build rather than assembled once. The campaign is organised after the AIAA G-077 guide~\cite{noauthor_guide_1998,oberkampf_verification_2010} into pillars kept deliberately separate: \emph{code verification} (order of accuracy, primarily by the method of manufactured solutions), \emph{solution verification} (grid-convergence uncertainty by the Richardson-based Grid Convergence Index), and \emph{validation} (comparison against analytic, benchmark, and experimental references along the G-077 building-block hierarchy). The solution-verification GCI furnishes the numerical uncertainty $U_{\mathrm{num}}$ that feeds the validation uncertainty $U_{\mathrm{val}}=\sqrt{U_{\mathrm{num}}^2+U_{\mathrm{input}}^2+U_D^2}$ of ASME V\&V~20~\cite{noauthor_standard_nodate,celik_procedure_2008}; Sec.~\ref{sec:credibility} closes with a credibility self-assessment against NASA-STD-7009B~\cite{noauthor_nasa_nodate}.
+
+Every number quoted below is recorded by the passing suite on the build of record (revision \texttt{a097bb2}, AppleClang/Release, IEEE double precision), with the multi-rank subset re-run under \texttt{mpirun -n} and adapting to the optimal partition count for each volume decomposition.
+
+The validation suite follows one convention throughout, stated here once. Every case is driven from a freestream initial condition to a residual-converged steady state (a six-order spatial-residual drop), never initialised from the reference solution and never a fixed-time snapshot. The only intelligent initialisation permitted is the aforementioned full-grid initialisation, which runs \emph{separately} for each of the GCI grids. Each reports the ASME V\&V 20 comparison error $E_v=S-D$ against the validation uncertainty $U_{\mathrm{val}}$, with $U_{\mathrm{num}}$ taken from a systematically refined three-grid triplet through the Roache GCI, $U_{\mathrm{input}}=0$ (prescribed freestreams), and $U_D=0$ for exact references or the documented scatter for empirical ones. Gates assert the real physical target at a physically justified tolerance and stay \emph{red} until met -- a validation test that goes green at partial agreement would silently assert a capability the solver does not have, so tolerances are never loosened to pass. For example, the NEQAIR flight-radiance comparison of Sec.~\ref{sec:vv-rad}, is work in progress and therefore excluded from the below claims.
+
+\subsection{Code verification: spatial order of accuracy}
+\label{sec:vv-spatial}
+
+MANTA is by design a high-order reconstruction front-end on a second-order finite-volume back-end, and the campaign measures the two separately. The reconstruction operators are verified in isolation against the exact face value of a smooth sinusoid ($L_\infty$ norm, grids $32$--$64$--$128$); Table~\ref{tab:recon_order} shows every scheme at its design order, with the fifth-order family reaching its asymptote to within one percent of the design rate. The \emph{assembled} spatial operator is then verified per topology by the method of manufactured solutions on the smooth field
+\begin{align}
+\rho &= \rho_0 + A_\rho\sin(2\pi x)\sin(2\pi y), &
+u &= u_0 + A_u\sin(2\pi x)\cos(2\pi y), \notag\\
+v &= v_0 + A_v\cos(2\pi x)\sin(2\pi y), &
+p &= p_0 + A_p\cos(2\pi x)\cos(2\pi y),
+\label{eq:mms}
+\end{align}
+whose analytic source (plus a constant-$\mu$ viscous source for the Navier--Stokes variant) is cell-averaged with a nine-point Gauss--Legendre rule and imposed through exact-MMS ghost states. The order is measured in an interior $L_2$ norm, a boundary border excluded, so boundary-stencil effects do not contaminate the rate; Table~\ref{tab:spatial_order} reports the observed orders with the finest-grid errors, and Fig.~\ref{fig:mms-spatial} plots the underlying error curves against their slope guides.
+
+\begin{figure}[H]
+\centering
+\figplace{fig-mms-spatial.pdf}{6.5cm}
+\caption{Spatial code verification. Left: reconstruction front-end face-state
+$L_\infty$ error against the exact sinusoid, with slope guides at orders 1,
+2, 4, and 5 (Table~\ref{tab:recon_order}). Right: full-operator interior
+$L_2$ MMS error on both topologies, quadrature-capped at slope 2, with the
+sweep-aligned structured case realising the front-end's slope 5
+(Table~\ref{tab:spatial_order}).}
+\label{fig:mms-spatial}
+\end{figure}
+
+\begin{table}[H]
+\centering\footnotesize\setlength{\tabcolsep}{6pt}
+\caption{Reconstruction front-end verification in isolation: face-state $L_\infty$
+error against the exact value of a smooth sinusoid, grids $32$--$64$--$128$
+(finest refinement pair quoted). All schemes meet their design order.}
+\label{tab:recon_order}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Scheme & Design order & Observed $\hat p$ & $L_\infty$ at $N{=}128$ \\
+\midrule
+First order & 1 & $1.00$ & $4.9\times10^{-3}$ \\
+MUSCL (minmod) & 2 & $2.00$ & $3.2\times10^{-4}$ \\
+Central4 & 4 & $4.00$ & $1.9\times10^{-8}$ \\
+WENO5 & 5 & $5.04$ & $3.2\times10^{-9}$ \\
+WENO5-Z & 5 & $5.00$ & $4.7\times10^{-10}$ \\
+TENO5 & 5 & $5.00$ & $4.7\times10^{-10}$ \\
+TENO5-A & 5 & $5.00$ & $4.7\times10^{-10}$ \\
+TENO5-RBF & 5 & $5.00$ & $4.7\times10^{-10}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering\footnotesize\setlength{\tabcolsep}{5pt}
+\caption{Full-operator spatial order of accuracy from MMS on the field of
+Eq.~\eqref{eq:mms} (interior $L_2$ norm, grids $16$--$32$--$64$; observed order
+from the finest pair). The assembled operator is face-quadrature-capped at
+second order; fifth order is realised where the cap is inactive
+(sweep-aligned structured flow).}
+\label{tab:spatial_order}
+\begin{tabular}{@{}llccl@{}}
+\toprule
+Path / configuration & Scheme & $\hat p$ & $L_2$ at $N{=}64$ & Source of the cap \\
+\midrule
+Unstructured, full operator & WENO5 & $2.09$ & $7.8\times10^{-3}$ & midpoint face flux \\
+ & TENO5 & $1.88$ & $1.8\times10^{-2}$ & midpoint face flux \\
+ & MUSCL & $1.51$ & $3.2\times10^{-2}$ & minmod at smooth extrema \\
+Unstructured, curvilinear warp $0.04$ & WENO5 & $2.09$ & $7.2\times10^{-4}$ & midpoint face flux \\
+ & TENO5 & $1.99$ & $7.2\times10^{-4}$ & midpoint face flux \\
+Structured, full 2-D operator & WENO5, TENO5 & $2.16$ & $2.8\times10^{-4}$ & transverse bilinear blend \\
+\quad with $N_g{=}3$ Gauss points & TENO5 & $1.95$ & $2.9\times10^{-3}$ & blend, not point count \\
+Structured, curvilinear warp $0.04$ & WENO5 / TENO5 & $2.00$ / $1.96$ & $9.0\times10^{-4}$ & transverse bilinear blend \\
+Structured, sweep-aligned (1-D) & WENO5 / TENO5 & $5.17$ / $5.00$ & $1.5\times10^{-5}$ & none -- front-end realised \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Three observations from Table~\ref{tab:spatial_order} merit note. First, the second-order cap is a property of the face quadrature -- a single midpoint flux per face on the unstructured path, a bilinear transverse blend on the structured path -- and not of the reconstruction: raising the structured tensor-product rule to three Gauss points leaves the rate at two, while a sweep-aligned (transverse-invariant) flow, for which the blend is exact, realises the full fifth order of the front-end in the assembled operator. Each high-order full-operator test carries a deliberate upper-bound gate ($\hat p<3$) that will fire when a planned higher-order back-end quadrature is implemented, forcing the gate to be re-pointed rather than silently passed. Second, high-order reconstruction still pays at fixed mesh even where the asymptotic order is capped: on the advecting isentropic vortex (which isolates spatial error by a single residual evaluation on the cell-averaged exact state), the fifth-order front-end lowers the error constant by more than an order of magnitude relative to MUSCL at $64^2$. Third, the rates survive mesh distortion -- a smooth curvilinear node warp of amplitude $0.04$ holds $\hat p\approx2$ on both topologies -- and constructing that case surfaced and fixed a latent factor-of-two cell-volume double-count in the unstructured metric synthesis, a concrete return on the MMS investment. A random per-node skew is deliberately avoided: a residual-based MMS supraconverges (reads order zero) on meshes equally skewed at every level, so the warp is smooth by construction.
+
+On fully-polyhedral geometry, the mesh-generation battery carries its own MMS gates: the Green--Gauss gradient holds $\hat p = 1.98$--$1.99$ at the co-spherical junction cells of a graded Voronoi lattice, while on the boundary-layer-to-polyhedral transition row of a sphere-cone mesh the least-squares gradient sustains first-order convergence ($\hat p\approx0.96$--$0.99$) where plain Green--Gauss stalls at order zero -- an assertion the suite keeps \emph{inverted} as a living tripwire, documenting a known scheme limitation.
+
+Order preservation across a 2:1 adaptive-refinement interface is measured rather than assumed, on a mesh family whose refined patch is geometrically self-similar under base refinement and with a uniform-mesh control. In the \emph{residual} study the bulk holds the design order ($\hat p=1.82$, gated $\ge1.8$) while the fixed-scale interface band supraconverges ($\hat p=0.18$ -- the same trap as random mesh skew, so the band rate is characterisation, not a gate) and the global norm follows the thin-band algebra at $0.91$. The \emph{solution} study, immune to supraconvergence, advects the isentropic vortex across the patch: WENO5 holds a global $\hat p=1.70$ against its uniform control of $2.14$ -- a real but bounded $\approx0.44$-order interface cost -- while MUSCL measures $1.75$ against a control of $1.80$ through the identical interface, isolating the cost to the WENO nonlinear weights reacting to the stencil-size jump rather than to the interface construction itself.
+
+\subsection{Code verification: temporal order of accuracy}
+
+Temporal error is isolated by Richardson refinement on $\Delta t$ at a fixed mesh and spatial operator, against an SSP-RK3 time-accurate reference (CFL~$0.02$) on the MMS system; the CFL ladder is $\{0.8,0.4,0.2,0.1\}$. Table~\ref{tab:temporal_order} reports the observed order at each refinement together with the finest-step error. The three implicit cases drive a production combination -- the Walker--Pernice JFNK formulation with assembled Steger--Warming preconditioner -- so the test verifies the implicit machinery end-to-end, not merely the multistep formula. BDF2 approaches its design order from below ($1.78\to1.90\to1.95$), the expected signature of a multistep method's startup transient; the one-step integrators sit on their design order at every rung. Figure~\ref{fig:mms-temporal} plots the ladders. For comparison against other assembled operators, see Section~\ref{sec:vv-jac}.
+
+\begin{figure}[H]
+\centering
+\figplace[0.6\linewidth]{fig-temporal-order.pdf}{6cm}
+\caption{Temporal code verification: $L_2$ error against $\Delta t$ for the
+four \texttt{TS} integrators under Richardson refinement at fixed mesh, with
+slope guides at orders 1, 2, and 3 (Table~\ref{tab:temporal_order}).}
+\label{fig:mms-temporal}
+\end{figure}
+
+\begin{table}[H]
+\centering\footnotesize\setlength{\tabcolsep}{6pt}
+\caption{Temporal order of accuracy of the PETSc \texttt{TS} integrators by
+Richardson refinement on $\Delta t$ (CFL ladder $0.8\to0.1$, fixed $64^2$ mesh).
+Observed orders quoted per refinement pair; the implicit rows run a real
+matrix-free Newton--Krylov solve every step.}
+\label{tab:temporal_order}
+\begin{tabular}{@{}llclc@{}}
+\toprule
+Integrator & PETSc type & Design & Observed $\hat p$ (per rung) & $L_2$ err.\ at CFL $0.1$ \\
+\midrule
+SSP-RK3 (explicit) & \texttt{ssp/rks3} & $3$ & $3.00,\ 3.00,\ 3.01$ & $1.0\times10^{-10}$ \\
+Backward Euler & \texttt{beuler} & $1$ & $1.03,\ 1.01,\ 1.01$ & $6.4\times10^{-5}$ \\
+BDF2 (multistep) & \texttt{bdf} & $2$ & $1.78,\ 1.90,\ 1.95$ & $2.1\times10^{-6}$ \\
+ESDIRK3 (one-step) & \texttt{dirk/es324sal} & $3$ & $3.00,\ 3.00,\ 3.00$ & $1.3\times10^{-9}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Geometric and discrete conservation}
+\label{sec:vv-conservation}
+
+Free-stream preservation and the geometric conservation law are verified by a single residual evaluation of a uniform state: $R(\mathrm{const})=0$ holds if and only if the discrete area vectors close, $\sum_f\mathbf{S}_f=\mathbf{0}$, and then the field stays uniform under any integrator. Table~\ref{tab:gcl} shows the measured residuals at round-off on both topologies -- including across a 2:1 adaptive-refinement interface, where the polyhedral coarse-fine fragment area vectors close exactly -- with the curvilinear cases two decades above the uniform ones purely through metric-arithmetic round-off accumulation, not an $O(h)$ metric inconsistency.
+
+\begin{table}[H]
+\centering\footnotesize\setlength{\tabcolsep}{6pt}
+\caption{Free-stream preservation / GCL: maximum residual $\max_c|R_c|$ of a
+uniform state on a $32^2$ mesh, measured across the WENO5, TENO5, and MUSCL
+reconstructions (worst case quoted; gate $|R|<10^{-11}N$).}
+\label{tab:gcl}
+\begin{tabular}{@{}lc@{}}
+\toprule
+Configuration & $\max|R|$ \\
+\midrule
+Uniform, structured and unstructured & $\le1.1\times10^{-14}$ \\
+Curvilinear warp, structured and unstructured & $\le3.8\times10^{-13}$ \\
+2:1 adaptive-refinement interface & $\le7.1\times10^{-15}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Discrete conservation is verified separately. A closed slip-wall box conserves total mass and energy to relative $4.4\times10^{-16}$ and $6.6\times10^{-16}$ respectively over ten time steps -- round-off, i.e.\ exact discrete telescoping of the face fluxes; a triply-periodic box conserves all invariants to the same magnitude; every adaptive state transfer conserves $\sum_c V_c\U_c$ to better than $10^{-12}$; and a checkpoint/restart reproduces a live continuation bitwise. Distributed adaptation reproduces the serial residual per leaf, and the multi-rank pseudo-transient controller reproduces the globally summed residual norm across ranks.
+
+The orbit-measure symmetry reductions carry their own well-balancing analogue of the GCL. Under sector or steradian face weights a uniform state is \emph{not} a discrete equilibrium of the flux terms alone -- the tests first assert that the source-free radial imbalance is genuinely $O(1)$ (spherical static column: $5.6$) -- and the geometric momentum source built from the discrete closure excess must cancel it exactly. It does: with the source active, $\max|R|\sim10^{-15}$ for a uniform axial stream on Cartesian off-axis, axis-touching, and structured-curvilinear axisymmetric meshes, and $3\times10^{-15}$ for the spherical static state, with the pressure source Jacobian verified against central differences.
+
+\subsection{Code verification: Jacobian consistency}
+\label{sec:vv-jac}
+
+The implicit operator is verified in layers, with the approximate-Newton gap \emph{quantified rather than asserted away}. The assembled preconditioner is a deliberate approximate operator -- a Steger--Warming split is not the derivative of an HLLC flux, a first-order stencil is not the derivative of a fifth-order residual, and ghost-equals-owner boundary rows are not the true mirror linearisation -- so machine-precision gates are applied only where exactness is owed, and the distance elsewhere is measured. A deterministic central-difference Fr\'echet harness differences the full residual along seeded directions and reports the relative operator gap $\lVert P\mathbf{v}-\delta_\varepsilon\mathbf{R}\cdot\mathbf{v}\rVert/\lVert\cdot\rVert$. Where exactness is owed, it is found: on a supersonic face, where the upwind split \emph{is} the flux derivative, the gap is $1.2\times10^{-10}$; two assembled shifts differ by exactly $(\alpha_1-\alpha_2)I$ to $10^{-12}$; the producer-level source Jacobians (relaxation, chemistry, turbulence sensors) match finite differences; and the split's algebraic invariants ($A^++A^-=A_n$, signed spectra, supersonic limits) hold to $10^{-9}$. Where it is not owed, the distance is decomposed: per-face subsonic flux-function distance $0.04$--$0.20$, interior-row gap $\approx0.45$, all-rows gap $\approx0.86$ (boundary closure doubles it), all bounded by an envelope gate of $1.2$.
+
+The automatic-differentiation builder of Sec.~\ref{sec:jacobian} then completes the attribution. Differentiating the actual HLLC flux collapses the per-face flux-function gap to $2\times10^{-10}$, and the interior full-residual gap under directions that avoid the limiter kink to $4\times10^{-9}$ -- while the general-direction interior gap stays at $\approx0.44$. The residual approximate-Newton mismatch is therefore the boundary ghost-response closure, not flux physics -- a precisely identified target now closed by the exact per-boundary-condition rows: with the wide-stencil AD operator, \emph{every} row of the assembled Jacobian on a curved wall/farfield/outflow case, wall corners included, matches central finite differences of the residual, inviscid and Sutherland-viscous alike. That end-to-end exactness is what certifies the operator for the true-Newton PTC path.
+
+\subsection{Robustness verification: carbuncle, linear stability, and positivity}
+\label{sec:vv-robust}
+
+The carbuncle resistance and positivity claimed for the specialised solvers of Table~\ref{tab:riemann} are themselves verified, by three complementary instruments run over \emph{every} registered flux function (Table~\ref{tab:robustness}). The empirical harness holds a Mach-6 standing shock on a transversely periodic strip seeded with a $0.3\,\Delta x$ ripple and classifies each solver, after two hundred odd--even e-fold times, by transverse shock-position spread and residual transverse velocity: the classic Quirk result~\cite{quirk_contribution_1994} is reproduced, including the carbuncle-proneness of the exact Godunov solver itself. The linearized instrument assembles the Dumbser--Moschetta--Gressier stability matrix~\cite{dumbser_matrix_2004} for the same shock strip from flux Jacobians of the pointwise kernels and classifies by the sign of the dominant growth rate, agreeing with the empirical verdict through an empty dead band wherever the finite-difference Jacobian is smooth. Its value is mechanism attribution: AUSM$^+$-up is strongly linearly \emph{stable} ($\lambda_{\max}=-10.4$) yet empirically diverges, so its failure is nonlinear robustness, not a carbuncle -- a distinction only the pairing reveals. The positivity instrument time-integrates the 123 double-rarefaction, strong-blast, planar Noh, and Leblanc problems against the exact Riemann solution with the state floors armed as tripwires: the positivity class completes every case with no floor fired and finite states throughout, while Roe fires 2658 floors on the 123 problem as the positive control. Figure~\ref{fig:carbuncle} shows the three canonical empirical outcomes, and Fig.~\ref{fig:dmg} sets the linearized growth rates against the empirical verdicts.
+
+\begin{figure}[H]
+\centering
+\figplace{fig-carbuncle-gallery.png}{5.5cm}
+\caption{The empirical carbuncle harness: density fields of the seeded Mach-6
+standing shock after two hundred odd--even e-fold times. Left: a flat solver
+(\texttt{hlle}) heals the ripple. Centre: \texttt{roe} grows the classic
+carbuncle. Right: \texttt{roe} with the multidimensional H-correction is
+hard-gated flat ($\max|v|\;1.42\to0.004$) at shock thickness comparable to
+HLLC.}
+\label{fig:carbuncle}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\figplace[0.7\linewidth]{fig-dmg-lambda.pdf}{6cm}
+\caption{Linearized (DMG) dominant growth rate per flux function, coloured by
+the empirical Mach-6 verdict of Table~\ref{tab:robustness}. The stable and
+unstable populations separate cleanly across the empty dead band;
+AUSM$^+$-up's strongly negative bar against its empirical divergence isolates
+its failure as nonlinear robustness rather than a carbuncle.}
+\label{fig:dmg}
+\end{figure}
+
+\begin{table}[H]
+\centering\footnotesize\setlength{\tabcolsep}{5pt}
+\caption{Robustness classification of the flux functions: empirical Mach-6
+carbuncle harness (transverse-velocity amplitude), linearized DMG growth rate,
+and hard-gated near-vacuum positivity. The rotated pair is deferred by the
+linear instrument (non-smooth finite differences at zero-jump faces);
+$^\dagger$the rotated solvers' flat verdict is from wall-free shock strips --
+a blunt-body case (Sec.~\ref{sec:vv-val}) found \texttt{rotated\_rhll}
+converging to a spurious shock-free solution against a symmetry wall, a
+tracked finding.}
+\label{tab:robustness}
+\begin{tabular}{@{}lllc@{}}
+\toprule
+Flux function & Empirical M6 verdict ($\max|v|$) & $\max\,\mathrm{Re}\,\lambda$ (DMG) & Positivity (hard gate) \\
+\midrule
+\texttt{hlle} & flat & $+0.30$ & pass \\
+\texttt{rusanov} & flat & $-0.28$ & -- \\
+\texttt{hll} & flat & $+0.24$ & -- \\
+\texttt{hlle\_lm} & flat & $+0.62$ & -- \\
+\texttt{rotated\_rhll} & flat$^\dagger$ & deferred & -- \\
+\texttt{rotated\_bouchut} & flat$^\dagger$ & deferred & pass \\
+\texttt{exact} & carbuncle ($0.21$) & $+4.0$ & pass \\
+\texttt{hllc} & carbuncle ($0.60$) & $+3.9$ & -- \\
+\texttt{bouchut3} & carbuncle ($0.64$) & $+4.3$ & pass \\
+\texttt{hllc\_lm} & carbuncle ($0.72$) & unstable & -- \\
+\texttt{hllem} & carbuncle ($1.35$) & $\approx+7.0$ & -- \\
+\texttt{roe} & carbuncle ($1.42$; $0.004$ with H-fix) & $\approx+7.0$ & floors fire (control) \\
+\texttt{ausm\_plus\_up} & diverges (nonlinear) & $-10.4$ (stable) & -- \\
+\texttt{entropy\_stable} & diverges & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This matrix instrument forced a carbuncle blend redesign. The original face-local instrument did \emph{not} suppress the Roe carbuncle ($\max|v|$ unchanged at $1.42$ despite $\sim10^6$ blend events): its sensor read $\beta=0.998$ on shock-normal faces but exactly zero on the transverse faces where the mode grows, and the matrix analysis showed a transverse Rusanov blend collapsing $\lambda_{\max}$ from $+7.0$ to $+0.24$ (96\%) where a shock-normal blend manages only 24\%. The rebuilt multidimensional H-correction of Sec.~\ref{sec:robust} injects exactly that transverse dissipation; Roe with the fix is verified flat ($\max|v|\;1.42\to0.004$) at shock thickness comparable to HLLC.
+
+\subsection{Code verification: exact-solution benchmarks}
+\label{sec:vv-exact}
+
+Complementing the MMS studies, a set of exact-solution benchmarks exercises the assembled shock-capturing operator against closed-form references (Table~\ref{tab:exact_benchmarks}). The Sedov and Noh references implement the complete Kamm--Timmes closed-form interior profiles~\cite{kamm_ecient_nodate,noh_errors_1987}, themselves validated cell-for-cell against the published tables before the solver is measured against them; the observed departures (shock smearing, finite-energy-deposit offset, wall-heating dip) are the documented artifacts of the discretisation, bounded and characterised rather than hidden. The two curvilinear cases -- an exact supersonic free vortex in a quarter annulus and Ringleb's hodograph flow~\cite{ringleb_exakte_1940}, both with curved slip walls -- close the loop on the curvilinear metric path. The reference for the Shu--Osher and positivity cases is the iterative exact Godunov solver of Table~\ref{tab:riemann}, single-sourced with the production flux. Figure~\ref{fig:blast} overlays the computed solutions on their references, and Fig.~\ref{fig:curvilinear} shows the curved-wall pair.
+
+\begin{figure}[H]
+\centering
+\figplace{fig-exact-benchmarks.png}{6cm}
+\caption{Exact-solution benchmarks. Left: Shu--Osher density at $t=1.8$
+(WENO5, TENO5, MUSCL) against the resolved reference. Centre: Sedov
+cylindrical-blast density contours with the axis and diagonal radial
+profiles overlaid on the Kamm--Timmes closed form. Right: Noh implosion
+radial density profile against the $16\rho_0$ plateau, the bounded
+wall-heating dip visible at the origin.}
+\label{fig:blast}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\figplace{fig-ringleb-annulus.png}{5.5cm}
+\caption{Curvilinear exact benchmarks: Mach contours and streamlines for the
+supersonic free vortex in a quarter annulus (left) and Ringleb's hodograph
+flow (right), both on body-fitted curved slip walls, with the meshes
+underlaid.}
+\label{fig:curvilinear}
+\end{figure}
+
+\begin{table}[H]
+\centering\footnotesize\setlength{\tabcolsep}{5pt}
+\caption{Exact-solution shock-capturing benchmarks. All gates green on the
+build of record.}
+\label{tab:exact_benchmarks}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Case & Reference & Setup & Result \\
+\midrule
+Shu--Osher entropy wave~\cite{shu_efficient_1989} & resolved WENO5 ($N{=}800$) & $M{=}3$, $t{=}1.8$ & $L_1$ order $2.06$; wave peak $98.6\%$ \\
+ & & & (TENO5 $99.6\%$); shock within $0.25\,\Delta x$ \\
+Sedov cylindrical blast & Kamm--Timmes closed form & $64^2$, $\gamma{=}1.4$ & interior $L_1(\rho)=0.35$; exponent $0.501$; \\
+ & & & axis/diagonal isotropy $0.4\,\Delta x$ \\
+Noh cylindrical implosion & closed form ($16\rho_0$ plateau) & $64^2$, $\gamma{=}5/3$ & plateau $15.08$; shock at $t/3$ to $0.7\,\Delta x$; \\
+ & & & wall-heating dip bounded \\
+Annulus free vortex & exact isentropic Euler & curved slip walls & $L_2(\rho)$ order $2.03\to1.99$ \\
+Ringleb hodograph flow~\cite{ringleb_exakte_1940} & exact (Newton map inversion) & curved streamline walls & $L_2(\rho)$ order $1.59\to1.69$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Thermochemistry verification against NASA CEA}
+\label{sec:vv-chem}
+
+The thermochemistry is verified bottom-up in a zero-dimensional reactor, isolating the kinetics from transport and flow. Holding $(T,\rho)$ at compositions computed by NASA CEA~\cite{mcbride_computer_1996,noauthor_nasacea_2026}, MANTA's forward and backward rates -- formed by detailed balance from the thermodynamic equilibrium constant, not a kinetic curve fit -- must balance at the CEA equilibrium, conserve mass and elements, and be entropy-producing off equilibrium; Table~\ref{tab:ver-equilibrium} summarises. Because the equilibrium constant is built from the same NASA-9 Gibbs data as the equation of state, the residual imbalance measures thermodynamic-data fit differences against CEA, not kinetic error; unifying the chemistry onto the shared NASA-9 thermodynamics collapsed the worst active imbalance from roughly five percent (under a deprecated NASA-7 fit) to the present $1.3\%$. The second-law gate is constructed from MANTA's own thermodynamics: the entropy-production rate is positive off equilibrium at every tabulated state and falls by more than seven decades (Park-5: $|\sigma|\le3\times10^{-2}$ against an off-equilibrium scale of $2\times10^{6}\,\unit{\W\per\cubic\m\per\K}$) at the CEA composition.
+
+\begin{table}[H]
+\centering\footnotesize\setlength{\tabcolsep}{6pt}
+\caption{Thermochemistry and equilibrium-gas validation: the Park
+finite-rate sources in a 0-D reactor against NASA CEA equilibrium (constant
+$(T,\rho)$ states, $3$--$6$~kK), and the equilibrium tier against its
+references. The reactor imbalance is thermodynamic-data fit difference, not
+kinetic error.}
+\label{tab:ver-equilibrium}
+\begin{tabular}{@{}llc@{}}
+\toprule
+Mechanism / check & Metric & Result \\
+\midrule
+Park-5 vs CEA, 13 states & worst active $|R_f-R_b|/\max$ & $1.3\%$ \\
+Park-5 mass and N, O elements & $|\sum_s\dot\omega_s|$, element flux & round-off \\
+Park-5 entropy production & $\sigma>0$ off-eq.; at eq.\ & $\le3\times10^{-2}$ vs $2\times10^{6}$ scale \\
+Park-11 (ionised) vs CEA, 12 states & worst neutral-subset imbalance & $1.3\%$ \\
+Park-11 element and charge conservation & all 24 reactions, stoichiometric & exact ($\le1\,m_e$ defect) \\
+Park-11 entropy production & $\sigma>0$ off-eq., $\to0$ at eq. & pass \\
+\midrule
+Tannehill fits vs LAURA reference & 1554 states, all outputs & $\le10^{-10}$ \\
+Gibbs minimiser vs CEA, 12-species air & $p$, $h$ at 70 equilibrium states & $0.2\%$ \\
+Tabulated EOS vs curve fits & overlap-band round trip & within band ($\le6\%$) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The equilibrium-gas tier is validated against the same pedigree (Table~\ref{tab:ver-equilibrium}, lower block): the RP-1181 curve-fit implementation reproduces the LAURA reference evaluation over 1554 states to $10^{-10}$, the element-potential Gibbs minimiser matches CEA's twelve-species air equilibrium pressure and enthalpy to $0.2\%$ over 70 states, and the tabulated equation of state agrees with the curve fits across their overlap band within the table's interpolation tolerance. The species-source Jacobians used by the implicit solver are verified against central finite differences, as are the differentiated turbulence sensor functions.
+
+\subsection{Solution verification: grid-convergence uncertainty}
+\label{sec:vv-gci}
+
+A three-grid Grid Convergence Index harness -- the Roache--Richardson procedure with factor of safety $F_s=1.25$, as formalised by Celik et al.~\cite{celik_procedure_2008} -- backs the observed-order computation in every convergence study above and produces the $U_{\mathrm{num}}$ band that ASME V\&V 20 requires. Its headline application is the laminar flat-plate skin-friction functional: on a four-grid ladder up to $16\times64$, the $C_f$ functional converges at observed order $\hat p=2.96$, the Richardson extrapolant $C_f=1.28105\times10^{-2}$ lands within $0.017\%$ of the exact Blasius value $1.28084\times10^{-2}$ -- closer than the finest grid itself ($0.032\%$) -- and the fine-grid GCI reports a relative numerical-uncertainty band of $1.9\times10^{-4}$. The harness itself is unit-verified against synthetic error sequences of known first and second order before it is trusted with solver data.
+
+\subsection{Analytic integration benchmarks}
+\label{sec:vv-analytic}
+
+Ahead of the formal validation suite, a set of continuously run integration benchmarks exercises the assembled solver -- reconstruction, flux, boundary conditions, and time integrator together -- against exact references (Table~\ref{tab:analytic}); all pass on every build. The Sod tube runs through both the explicit and the full implicit production path (BDF2, matrix-free Newton--Krylov, assembled ILU preconditioner), so the shock-capturing gates also validate the implicit machinery on a discontinuous flow. The incompressible-limit Blasius case illustrates the ASME V\&V 20 decomposition on an analytic reference: with $U_D=U_{\mathrm{input}}=0$, the comparison error $E_v=0.032\%$ sits above the $U_{\mathrm{num}}=0.019\%$ band of Sec.~\ref{sec:vv-gci}, and the excess is attributable to the reference itself -- the self-similar Blasius solution is a boundary-layer approximation to the Navier--Stokes equations the solver actually discretises -- rather than to unresolved numerical error. The turbulent-Couette rung closes the loop on the Spalart-Allmaras~\cite{spalart_one-equation_1992} turbulence implementation: the equilibrium log layer recovers $\mu_t\approx\rho\kappa u_\tau d$ within five percent and the production--destruction balance within two.
+
+\begin{table}[H]
+\centering\footnotesize\setlength{\tabcolsep}{5pt}
+\caption{Analytic integration benchmarks, run on every build. Each tolerance
+is a standing assertion in the suite; observed values are quoted where the
+test prints them.}
+\label{tab:analytic}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Case & Reference & Setup & Asserted (observed) \\
+\midrule
+Sod shock tube & exact Riemann~\cite{toro_riemann_2009} & 100 cells, $t{=}0.25$ & wave locations and plateau values \\
+\quad implicit variant & same & BDF2 + Newton + ILU(0) & same gates through implicit path \\
+Blasius plate & $C_f=0.664/\sqrt{Re_x}$ & 4 grids to $16\times64$ & $C_f$ $1\%$ (obs.\ $0.03\%$); $\delta^\ast,\theta$ $2\%$ \\
+Couette & linear profile & $4\times16$ & exact gradient; stationary in time \\
+Poiseuille & parabolic profile & up to $4\times32$ & $\mu u''=-G$ to $10^{-6}G$ \\
+Turbulent Couette & SA log layer & $4\times16$ & $\mu_t$ vs $\rho\kappa u_\tau d$ within $5\%$ \\
+Structured $\equiv$ unstructured & cross-topology regression & Sod IC, $100$ cells & identical states \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Formal validation: the G-077 building-block hierarchy}
+\label{sec:vv-val}
+
+The formal validation campaign is organised as the G-077 building-block hierarchy under the convention of Sec.~\ref{sec:vv} (freestream-to-steady driving, grid-triplet GCI, $E_v$ against $U_{\mathrm{val}}$, red-until-met gates). Its organising idea is a ladder of decreasing certainty and increasing relevance, and every case sits on a numeric \emph{layer} of it. Layer~0 asks whether the discretisation solves the equations it claims to: the reference is an exact or code-to-code solution of the \emph{same} governing equations, so $U_D\approx0$ and a pass certifies the implementation, not the physics. Layer~1 asks whether each physical model reproduces its isolated canonical behaviour against an analytic, correlation, or DNS datum; Layer~2 whether those models combine correctly on a hard multi-physics benchmark -- a canonical experiment; and Layer~3 whether the assembled system reproduces a subsystem or flight measurement. Climbing the ladder trades certainty for relevance -- the reference degrades from exact to experimental as the case approaches the target application -- while the verdict, $|E_v|\le U_{\mathrm{val}}$, is read identically at every rung. The five validation tables (Tables~\ref{tab:val-inviscid}--\ref{tab:val-radiation}) therefore share one format -- \emph{layer, case, references, models, metrics, $E_v$ ($U_{\mathrm{val}}$), $\hat p$ (ratio)} -- so the campaign reads as one story: the \emph{models} column names the physical model actually exercised (the Euler operator, the \Field{laminar} closure, a turbulence-closure key, a thermochemical model, or a radiation-transport method), and $\hat p$ (ratio) is the Richardson observed order where a GCI applies (scale-resolving cases instead carry a two-level resolution study, ``res.'').
+
+\subsubsection{Euler validation}
+
+\begin{table}[H]
+\centering\scriptsize\setlength{\tabcolsep}{3.5pt}
+\caption{Inviscid validation suite. Layer~0 cases carry exact or near-analytic
+references, so $U_D=0$; the Billig sphere (Layer~1) is an empirical datum
+($U_D{=}4\%$). Columns follow the shared format of Sec.~\ref{sec:vv-val};
+$\hat p$ (ratio) is the GCI observed order with the asymptotic ratio in
+parentheses.}
+\label{tab:val-inviscid}
+\begin{tabularx}{\linewidth}{@{}c >{\raggedright\arraybackslash}p{2.4cm} >{\raggedright\arraybackslash}p{1.9cm} >{\raggedright\arraybackslash}p{1.35cm} X c c@{}}
+\toprule
+Layer & Case & References & Models & Metrics & $E_v$ ($U_{\mathrm{val}}$) & $\hat p$ (ratio) \\
+\midrule
+0 & Normal shock, $M_1{=}2$ & Rankine--Hugoniot & Euler & $p_2/p_1$, $\rho_2/\rho_1$, $M_2$ & $\sim10^{-7}$ & exact (all grids) \\
+0 & Oblique-shock ramp, $M_1{=}5$, $15^\circ$ & oblique-shock & Euler & shock angle $\beta$; $\rho_2$, $p_2$ & $-0.01\%$; $<0.01\%$ & $1.71$ ($0.999$) \\
+0 & Prandtl--Meyer corner, $M_1{=}3$, $15^\circ$ & Prandtl--Meyer & Euler & $M_2$; $p_2/p_1$; $\rho_2/\rho_1$ & $-0.38$; $+0.15$; $-0.51\%$ & $1.49$ ($1.008$) \\
+0 & Regular reflection, $M_1{=}3$, $8^\circ$ & shock reflection & Euler & reflected angle; $p_3/p_1$ & $+0.04\%$; $-0.00\%$ & $3.68$ ($1.000$) \\
+0 & Taylor--Maccoll cone, $M_1{=}5$, $15^\circ$ & Taylor--Maccoll~\cite{taylor_air_1933} & Euler (axisym.) & conical $\beta$; surface $C_p$ & $+0.09\%$; $-0.04\%$ & $2.12$ ($0.996$) \\
+\addlinespace
+1 & Billig sphere standoff, $M_1{=}5$, $R=1$ & ballistic range~\cite{billig_shock-wave_1967} & Euler (axisym.) & $\Delta/R$ & --- & --- \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The inviscid ladder is almost entirely Layer~0: the Euler operator is measured against closed-form gas dynamics, so its comparison errors are numerical rather than modelling artefacts (Fig.~\ref{fig:inviscid}). Three features bear noting. The normal-shock jump is exact to $E_v\sim10^{-7}$ \emph{identically on all three grids} -- the conservation-exactness of the discretisation, with the captured shock holding station at $x_s=0.4994$ against the exact $0.5$. The Taylor--Maccoll cone carries a discriminating physical gate beyond its angle tolerance: the measured conical shock ($20.05^\circ$, exact $20.03^\circ$) must lie strictly below the two-dimensional wedge angle for the same deflection ($24.32^\circ$) -- the three-dimensional relieving effect, which a planar operator on the same meridian mesh cannot reproduce -- so the case genuinely validates the orbit-measure reduction rather than shock capturing alone. The Billig sphere is the single Layer~1 rung, the empirical-datum complement ($U_D=4\%$, the scatter of the ballistic-range data about the correlation).
+
+\begin{figure}[H]
+\centering
+\figplace{fig-inviscid-suite.png}{9cm}
+\caption{The inviscid validation suite of Table~\ref{tab:val-inviscid}, each case driven from a uniform freestream to a residual-converged steady state: (a) $M_1{=}5$ oblique-shock ramp; (b) $M_1{=}3$ Prandtl--Meyer corner; (c) $M_1{=}3$ regular shock reflection; (d) $M_1{=}5$ Taylor--Maccoll cone, annotated with the measured conical shock ($20.05^\circ$), the exact solution ($20.03^\circ$), and the planar wedge angle the relieving effect must undercut ($24.32^\circ$); (e) axisymmetric Billig sphere with the correlation hyperbola overlaid on the captured bow shock.}
+\label{fig:inviscid}
+\end{figure}
+
+\subsubsection{Laminar Navier-Stokes validation}
+
+\begin{table}[H]
+\centering\scriptsize\setlength{\tabcolsep}{3.5pt}
+\caption{Laminar Navier--Stokes validation, in the shared format of
+Sec.~\ref{sec:vv-val}. All cases run the \Field{laminar} closure. The CUBRC
+geometries, freestreams, and surface data are taken from the NATO STO AVT-136
+final report~\cite{research_and_technology_organization_assessment_2011}, whose
+companion LAURA/FUN3D solutions double as code-to-code references.}
+\label{tab:val-laminar}
+\begin{tabularx}{\linewidth}{@{}c >{\raggedright\arraybackslash}p{2.4cm} >{\raggedright\arraybackslash}p{1.9cm} >{\raggedright\arraybackslash}p{1.35cm} X c c@{}}
+\toprule
+Layer & Case & References & Models & Metrics & $E_v$ ($U_{\mathrm{val}}$) & $\hat p$ (ratio) \\
+\midrule
+1 & Flat-plate BL, $M_\infty{=}2$, isothermal $T_w/T_\infty{=}2$ & self-similar; Eckert $T^*$~\cite{eckert_engineering_2022}; van~Driest~\cite{van_driest_investigation_1952} & \Field{laminar} & $C_f\sqrt{Re_x}$, $\mathrm{St}\sqrt{Re_x}$, profiles at 3 stations & \begin{tabular}[t]{@{}l@{}}$C_f$ $+2.55\%$ ($2.0\%$)\\ $\mathrm{St}$ $+4.41\%$ ($3.6\%$)\end{tabular} & $2.26$ ($0.994$) \\
+1 & Sharp cone, $M_\infty{=}7.95$, $10^\circ$, $T_w/T_e{=}4$, axisym. & Taylor--Maccoll $+$ Mangler; scaled Eckert~\cite{eckert_engineering_2022} & \Field{laminar} & $C_f$, $\mathrm{St}$, $C_p$; station self-similarity & --- & --- \\
+\addlinespace
+2 & Sch\"ulein impinging SBLI, $M{=}5$ & DLR experiment~\cite{schulein_skin_2006} & \Field{laminar} & separation/reattachment, $C_f$, $C_p$ & --- & --- \\
+2 & Holden hollow-cylinder--flare & CUBRC / AVT-136~\cite{research_and_technology_organization_assessment_2011} & \Field{laminar} & separation length, $q_w$, $p_w$ & --- & --- \\
+\addlinespace
+3 & CUBRC double cone $25^\circ/55^\circ$ & CUBRC LENS / AVT-136~\cite{research_and_technology_organization_assessment_2011} & \Field{laminar} & peak $q_w$, separation extent & --- & --- \\
+3 & Edney shock--shock (III/IV) & Wieting / Holden & \Field{laminar} & peak-heating amplification & --- & --- \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The laminar ladder isolates the compressible viscous physics before turbulence is added. Its Layer~1 rungs test the one prediction a laminar hypersonic code must get right -- the wall fluxes of a compressible boundary layer -- by collapsing skin friction and Stanton number onto the self-similar solution under the Eckert reference-enthalpy and van~Driest scalings (Fig.~\ref{fig:laminar-unit}); a code that captures pressure but misses that scaling fails here, cheaply, rather than at flight scale. Layers~2 and~3 then add the shock--boundary-layer interaction and, in the hollow-cylinder flare, double cone, and Edney cases, the separation and shock-on-shock heating amplification that concentrate the modelling difficulty.
+
+The flat-plate comparison errors are quoted at the mid station $Re_x=5\times10^4$,
+where the station-to-station spread in $C_f\sqrt{Re_x}$ is $0.58\%$.
+
+\begin{figure}[H]
+\centering
+\figplace{fig-laminar-unit-rung.pdf}{6cm}
+\caption{Laminar viscous unit rungs: transformed skin friction
+$C_f\sqrt{Re_x}$ and Stanton number $\mathrm{St}\sqrt{Re_x}$ at the
+measurement stations of the compressible flat plate (left) and sharp cone
+(right) against the self-similar datum, with the Eckert reference-enthalpy
+and van Driest correlations as secondary references.}
+\label{fig:laminar-unit}
+\end{figure}
+
+\subsubsection{Turbulent Navier-Stokes validation}
+
+The turbulence campaign parallels the laminar viscous ladder of Table~\ref{tab:val-laminar}, climbing toward the same target application -- hypersonic turbulent shock/boundary-layer interaction -- but through the turbulence closures of Sec.~\ref{sec:turb}. It is deliberately staged so that \emph{implementation} error is squeezed out by code-to-code verification before \emph{model-form} error is measured against experiment, and so that the eddy-viscosity RANS closures are exercised on canonical wall turbulence before the compressibility transformation and the shock interaction are added. Every case names the closures it exercises in its \emph{models} column, with the full menu by class in Table~\ref{tab:val-turbulent-models}; the gates are applied per model -- SA versus SST versus GEKO -- so the model spread is always visible, and per-model results are reported so the reviewer sees which closure is closest.
+
+\begin{table}[H]
+\centering\footnotesize\setlength{\tabcolsep}{6pt}
+\caption{Turbulence closures under test, by class, with the input-deck keys
+that select them. Model formulations and references are given in
+Sec.~\ref{sec:turb}.}
+\label{tab:val-turbulent-models}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Class & Models (input-deck keys) \\
+\midrule
+RANS eddy-viscosity & \Field{sa\_rans}, \Field{sst\_komega}, \Field{sst\_komega\_v}, \Field{geko} \\
+RANS Reynolds-stress & \Field{rsm\_lrr} \\
+Hybrid RANS--LES & \Field{sa\_iddes} \\
+LES subgrid-scale & \Field{wale}, \Field{smagorinsky}, \Field{dynamic\_ke} \\
+Resolved / baseline & \Field{dns} (no SGS model), equivalent to \Field{laminar} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Three honesty rules run through every layer. First, a RANS closure carries irreducible \emph{model-form} uncertainty: a validated verdict here means $|E_v|\le U_{\mathrm{val}}$ with the model-form error carried explicitly in $U_D$, and never claims the model is exact. Second, scale-resolving results (LES, hybrid) are not Richardson-convergent -- a finer grid resolves \emph{more} scales rather than converging a single functional -- so their grid sensitivity is reported as a two-level resolution study, never as a GCI observed order; only the fully-averaged RANS cases carry a Roache GCI. Third, the code-to-code cases (Layer~0) have $U_D\approx0$, the reference being a converged solution of the \emph{same} model equations: they certify the implementation, not the physics, and are run first precisely to keep the downstream layers from confounding an implementation bug with a model deficiency.
+
+\begin{table}[H]
+\centering\scriptsize\setlength{\tabcolsep}{3.5pt}
+\caption{Turbulent validation ladder in the shared format of
+Sec.~\ref{sec:vv-val}, staged from code-to-code verification (Layer~0) through
+the unit problems (Layer~1) and turbulent-SBLI benchmarks (Layer~2) to the
+flight case (Layer~3). Model keys are defined in
+Table~\ref{tab:val-turbulent-models}; $\hat p$ (ratio) is reported only for the
+fully-averaged RANS cases -- scale-resolving cases (LES, hybrid) instead carry
+a two-level resolution study (``res.''). Entries ``---'' are in flight and
+reported per closure as their gates close.}
+\label{tab:val-turbulent}
+\begin{tabularx}{\linewidth}{@{}c >{\raggedright\arraybackslash}p{2.15cm} >{\raggedright\arraybackslash}p{1.75cm} >{\raggedright\arraybackslash}p{1.9cm} X c c@{}}
+\toprule
+Layer & Case & References & Models & Metrics & $E_v$ ($U_{\mathrm{val}}$) & $\hat p$ (ratio) \\
+\midrule
+0 & 2-D ZPG flat plate & NASA TMR~\cite{noauthor_turbulence_nodate} & \Field{sa\_rans}, \Field{sst\_komega}, \Field{geko} & $C_f(x)$, $C_d$, $u^+(y^+)$ & --- & --- \\
+0 & Bump-in-channel & NASA TMR & \Field{sa\_rans}, \Field{sst\_komega}, \Field{geko} & $C_p$, $C_f$ & --- & --- \\
+0 & NACA 0012 & NASA TMR & \Field{sa\_rans}, \Field{sst\_komega}, \Field{geko} & $C_l$, $C_d$, $C_p$ & --- & --- \\
+0 & Backward-facing step & NASA TMR & \Field{sa\_rans}, \Field{sst\_komega}, \Field{geko} & reattachment $x_r/H$ & --- & --- \\
+\addlinespace
+1 & Incompressible turbulent ZPG plate & Kármán--Schoenherr~\cite{white_viscous_2005} & \Field{sa\_rans}, \Field{sst\_komega}, \Field{geko} & $C_f(\mathrm{Re}_\theta)$, log-law $\kappa,B$ & --- & --- \\
+1 & Compressible flat plate, $M{=}2,4,6$, adiabatic $+$ cold wall & van~Driest~II~\cite{van_driest_investigation_1952}; DNS~\cite{pirozzoli_direct_2011,zhang_direct_2018} & \Field{sa\_rans}, \Field{sst\_komega} & VD-II $\bar C_f$, $\mathrm{St}$, $2\,\mathrm{St}/C_f$, $u_{\mathrm{VD}}^+$ & --- & --- \\
+1 & Decaying isotropic turbulence (CBC) & CBC~\cite{comte-bellot_simple_1971} & \Field{wale}, \Field{smagorinsky}, \Field{dynamic\_ke}, \Field{dns} & $E(\kappa)$ at 3 stations, resolved-KE decay & --- & res. \\
+1 & Turbulent channel, $\mathrm{Re}_\tau{=}180/395/590$ & DNS~\cite{moser_direct_1999,lee_direct_2015} & \Field{wale}, \Field{dynamic\_ke}, \Field{sa\_iddes} & $u^+(y^+)$, $R_{ij}^+$, resolved TKE & --- & res. \\
+1 & Taylor--Green vortex, $\mathrm{Re}{=}1600$ & DNS~\cite{engelmann_direct_2023} & \Field{dns}, \Field{wale}, \Field{smagorinsky} & $-\mathrm{d}k/\mathrm{d}t$, enstrophy & --- & res. \\
+1 & Square-duct secondary flow & DNS / exp. & \Field{rsm\_lrr} & secondary-flow velocity / anisotropy & --- & --- \\
+\addlinespace
+2 & Compression corner (Settles, $M{=}2.85$, ramp $8$--$24^\circ$) & Settles~\cite{settles_incipient_1976} & \Field{sa\_rans}, \Field{sst\_komega}, \Field{geko} & $p_w(x)$, $C_f$, sep./reattach., plateau & --- & --- \\
+2 & Impinging-shock STBLI; turbulent flare & Sch\"ulein~\cite{schulein_skin_2006}; AVT-136~\cite{research_and_technology_organization_assessment_2011} & \Field{sa\_rans}, \Field{sst\_komega} & $C_f$, $q_w$, $p_w$, $L_{\mathrm{sep}}$ & --- & --- \\
+\addlinespace
+3 & HIFiRE-1, fixed transition & HIFiRE-1~\cite{wadhams_ground_2008,maclean_ground_2008} & \Field{sa\_rans} & turbulent $q_w$, $p_w$ & --- & --- \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The closures climb this ladder from implementation to flight in four steps, and the single discriminating check at each step is what the campaign turns on. At Layer~0 the models are pinned to the NASA Turbulence Modeling Resource: on the official grids each must match the CFL3D/FUN3D drag and skin friction to within the published code-to-code spread ($\le1\%$) and recover the law of the wall, so any disagreement higher up is charged to the model and not the code~\cite{noauthor_turbulence_nodate}. Layer~1 introduces the hypersonic-relevant physics. The incompressible plate first fixes the log-law constants against the Kármán--Schoenherr correlation~\cite{white_viscous_2005}; then the pivotal unit case, a Mach sweep of the compressible plate (adiabatic and cold-wall), tests the van~Driest~II transformation, requiring the transformed skin friction, heat transfer, and velocity profile to collapse onto their incompressible form against the correlation and against supersonic and hypersonic DNS~\cite{van_driest_investigation_1952,pirozzoli_direct_2011,zhang_direct_2018} -- every case above inherits this compressibility scaling. Also at Layer~1, the scale-resolving closures are held to DNS on decaying isotropic turbulence, channel flow, and the Taylor--Green vortex and, per the second honesty rule, are read as two-level resolution studies rather than a GCI order~\cite{comte-bellot_simple_1971,moser_direct_1999,lee_direct_2015,engelmann_direct_2023}, while the Reynolds-stress closure adds the square-duct secondary flow that eddy-viscosity models predict as identically zero. Layer~2 is the target application, turbulent SBLI: the compression-corner and impinging-shock cases gate the inviscid pressure rise and separation plateau \emph{hard}, but treat the separation \emph{extent} as a characterization reported per closure, because RANS separation length is a known model-limited quantity -- and the SA/SST/GEKO spread on it is the most informative single result the campaign will produce~\cite{settles_incipient_1976,schulein_skin_2006}. Layer~3 closes on HIFiRE-1 flight heating, run fixed-transition because MANTA carries no transition-onset model -- a scope boundary stated in the table rather than hidden~\cite{wadhams_ground_2008,maclean_ground_2008}.
+
+\subsubsection{Reacting and thermochemical-nonequilibrium validation}
+
+\begin{table}[H]
+\centering\scriptsize\setlength{\tabcolsep}{3pt}
+\caption{Reacting and thermochemical-nonequilibrium validation regime, built
+bottom-up so each coupling is isolated before the next is added, in the shared
+format of Sec.~\ref{sec:vv-val}. The Layer~0 cases are verification-flavoured
+(analytic or code-to-code, $U_D\approx0$) but prerequisite to any reacting
+flowfield.}
+\label{tab:val-reacting}
+\begin{tabularx}{\linewidth}{@{}c >{\raggedright\arraybackslash}p{2.05cm} >{\raggedright\arraybackslash}p{1.75cm} >{\raggedright\arraybackslash}p{1.55cm} X c c@{}}
+\toprule
+Layer & Case & References & Models & Metrics & $E_v$ ($U_{\mathrm{val}}$) & $\hat p$ (ratio) \\
+\midrule
+0 & 0-D reactor equilibrium & NASA CEA (Table~\ref{tab:ver-equilibrium}) & equilibrium & detailed balance, elements, entropy & --- & --- \\
+0 & Equilibrium thermodynamics & RP-1181 / LAURA / CEA (Sec.~\ref{sec:vv-chem}) & equilibrium-air & fits, minimiser, table & --- & --- \\
+0 & Vibrational relaxation times & Millikan--White~\cite{millikan_systematics_1963} $+$ Park & Landau--Teller & $\tau_{vt}$ & --- & --- \\
+0 & Equilibrium normal-shock jump & real-gas tables & equilibrium EOS & EOS $+$ composition across a shock & --- & --- \\
+0 & Code-to-code reacting double cone & DPLR / LAURA / US3D & 2-T finite-rate & $q_w$, separation vs published & --- & --- \\
+\addlinespace
+1 & Fay--Riddell stagnation heating & correlation~\cite{fay_theory_1958} & finite-rate air & chemistry/transport/wall coupling, stagnation $q_w$ & --- & --- \\
+1 & Catalytic-wall heating bounds & analytic limits & $\gamma$-catalysis & $q_w$ between catalytic and non-catalytic limits & --- & --- \\
+\addlinespace
+2 & Lobb sphere standoff & ballistic range~\cite{lobb_chapter_1964} & 5-sp.\ air & dissociation via $\Delta/R$ vs velocity & --- & --- \\
+2 & Hornung \ce{N2} cylinder & interferograms \cite{hornung_non-equilibrium_1972} & 2-T \ce{N2} & 2-T dissociating nitrogen & --- & --- \\
+2 & EAST shock-tube radiance & NASA EAST~\cite{cruden_measurement_2020} (Sec.~\ref{sec:vv-rad}) & 11-sp.\ $+$ rad. & relaxation $+$ nonequilibrium radiance & --- & --- \\
+\addlinespace
+3 & RAM-C II flight & flight probes~\cite{jones_electrostatic-probe_1972} & Park-11 ionising & ionisation, ambipolar diffusion, $n_e$ & --- & --- \\
+3 & FIRE-II flight & flight calorimetry & 11-sp.\ $+$ rad. & convective $+$ radiative $q_w$ & --- & --- \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The reacting ladder is built strictly bottom-up, each layer adding one coupling. Layer~0 is verification-flavoured but indispensable: detailed balance against NASA CEA, the equilibrium-thermodynamics fits, the Landau--Teller relaxation times, and a code-to-code reacting double cone confirm that the chemistry, thermodynamics, and their Jacobians are right before any nonequilibrium flowfield is trusted. The stagnation-heating correlation and catalytic-wall bounds close the wall coupling at Layer~1; dissociation and nonequilibrium radiation follow at Layer~2 (Lobb, Hornung, EAST); and the fully coupled flight cases sit at Layer~3. Among these, RAM-C~II is the single highest-value target -- essentially the only flight dataset that exercises the Gupta--Yos transport, ambipolar diffusion, and Park-11 ionisation chain together -- with FIRE-II the one that couples convective and radiative heating. The gated quantity climbs from species concentrations through electron number density to flight heat flux, so a failure localises to the coupling its layer introduced.
+
+\subsection{Radiation verification and staged validation}
+\label{sec:vv-rad}
+
+The radiation subsystem is verified in tiers matching its architecture. The deterministic tangent-slab RTE integrator reproduces the closed-form homogeneous-slab radiance, the optically thin and thick limits, Beer--Lambert pure absorption, and the accumulated intensity profile at every marching point, all to a relative $10^{-9}$ -- analytic equalities, not convergence rates. The photon-Monte-Carlo tracer is verified against the same analytic solutions ($N_p^{-1/2}$ statistical convergence, energy conservation), its grey-wall surface exchange reproduces the Stefan--Boltzmann emission balance in enclosure problems, and the replicated optical domain is bitwise rank-count-invariant, with the two-rank source matching the serial reference per leaf.
+
+Validation of the spectral tier against line-by-line references is staged and in progress (Table~\ref{tab:val-radiation}). A reference harness feeds NEQAIR's own FIRE-II stagnation-line state through MANTA's opacity table and the tangent-slab integrator -- reproducing NEQAIR's geometry exactly, so that any discrepancy isolates the spectral table rather than the flowfield -- and asserts per-band and total radiance against NEQAIR's output~\cite{johnston_nonequilibrium_2008,cruden_measurement_2020}. The current table (atomic N, O, N$^+$, O$^+$ with multiband opacity binning and Boltzmann level populations) does not yet meet its acceptance gates: the gate is kept \emph{red} in the suite rather than loosened, because a green test at partial agreement would silently assert a capability the solver does not yet have. Completing the spectral rungs -- molecular band systems and a non-Boltzmann (QSS) population closure -- is active work, after which the EAST shock-tube radiance benchmark follows the same harness.
+
+\begin{table}[H]
+\centering\scriptsize\setlength{\tabcolsep}{3.5pt}
+\caption{Radiation verification and staged spectral validation, in the shared
+format of Sec.~\ref{sec:vv-val}. The Layer~0 rungs are code verification
+(analytic or committed-reference, $U_D\approx0$); every rung is scored by the
+same self-contained harness against the same oracle.}
+\label{tab:val-radiation}
+\begin{tabularx}{\linewidth}{@{}c >{\raggedright\arraybackslash}p{2.15cm} >{\raggedright\arraybackslash}p{1.7cm} >{\raggedright\arraybackslash}p{1.6cm} X c c@{}}
+\toprule
+Layer & Case & References & Models & Metrics & $E_v$ ($U_{\mathrm{val}}$) & $\hat p$ (ratio) \\
+\midrule
+0 & Closed-form RTE limits & analytic & tangent-slab & homogeneous slab, thin/thick, Beer--Lambert & $\lesssim10^{-9}$ & exact \\
+0 & Analytic RTE $+$ convergence & analytic & photon MC & analytic RTE, wall exchange, rank invariance & stat. & $N_p^{-1/2}$ \\
+0 & LOS spectral harness & NEQAIR (committed)~\cite{johnston_nonequilibrium_2008} & table $+$ slab & reproduce the NEQAIR geometry & --- & --- \\
+\addlinespace
+1 & FIRE-II radiance (atomic) & NEQAIR~\cite{johnston_nonequilibrium_2008} & MBOB table & per-band $+$ total stagnation-line radiance & --- & --- \\
+1 & FIRE-II molecular bands, QSS/$n_e$ & NEQAIR~\cite{johnston_nonequilibrium_2008} & table $+$ QSS & molecular band systems, non-Boltzmann populations & --- & --- \\
+\addlinespace
+2 & EAST shock-tube radiance & NASA EAST~\cite{cruden_measurement_2020} & table $+$ QSS & nonequilibrium radiance behind the shock & --- & --- \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\figplace[0.7\linewidth]{fig-fireii-bands.pdf}{6cm}
+\caption{FIRE-II stagnation-line radiance by wavelength region, MANTA
+against NEQAIR, at the spectral rung that closed the acceptance gate.}
+\label{fig:fireii}
+\end{figure}
+
+\subsection{Test infrastructure}
+\label{sec:testing}
+
+The evidence above is produced by a single automated suite, organised and ctest-labelled as unit tests (per-component correctness and factory registration -- every registered plugin carries a smoke test and at least one physics-correctness test), meshing tests (the polyhedral mesh-generation battery), integration tests (end-to-end solves), verification tests (the order-of-accuracy, conservation, Jacobian, and robustness studies above), and validation tests (the formal suite of Sec.~\ref{sec:vv-val}); the labels let development runs deselect the long meshing and validation groups while continuous integration runs everything. Coverage spans all Riemann solvers (uniform-flow zero-dissipation and left-right symmetry are mandatory for new entries, and every solver runs the robustness harness), all reconstructions and gradient operators (each with an MMS convergence gate), the gas/transport/chemistry models, the mesh readers, the implicit preconditioners and Jacobian builders, the adaptive-refinement pipeline, and the radiation harness (self-contained, from committed reference data, with no NEQAIR build dependency). Multi-rank behaviour runs as a dedicated $n$-rank invocation of the same binary with a lockstep listener that barriers every test boundary. Tolerances scale with the working floating-point precision -- assertions compare against $\max(\mathrm{tol},\,16\,\varepsilon\,|\mathrm{ref}|)$, a floor of $\sim3.5\times10^{-15}$ in double -- so the same gates hold under double- and single-precision builds, and the suite runs under coverage instrumentation.
+
+\subsection{Credibility assessment and planned validation}
+\label{sec:credibility}
+
+Table~\ref{tab:credibility} records a qualitative self-assessment against the NASA-STD-7009B credibility factors~\cite{noauthor_nasa_nodate}. The strong pillars are code verification, uncertainty machinery, and input pedigree; the deliberate gaps are validation depth and use history, which only accumulate with application.
+
+\begin{table}[t]
+\centering\footnotesize\setlength{\tabcolsep}{5pt}
+\caption{Qualitative credibility self-assessment against the NASA-STD-7009B
+factors.}
+\label{tab:credibility}
+\begin{tabular}{@{}lp{10.5cm}@{}}
+\toprule
+Factor & Evidence and status \\
+\midrule
+Verification & MMS spatial and temporal order per topology, including across AMR interfaces; GCL, conservation, and symmetry well-balancing at round-off; quantified Jacobian consistency with AD-exact attribution; robustness classification of every flux function; more than 1600 automated tests regenerated per build. \\
+Validation & Formal ASME V\&V 20 suite: inviscid (Table~\ref{tab:val-inviscid}), viscous laminar (Table~\ref{tab:val-laminar}), viscous RANS (Table~\ref{tab:val-turbulent}), CEA thermochemistry and equilibrium (Table~\ref{tab:ver-equilibrium}), and thermochemical non-equilibrium tiers (Table~\ref{tab:val-reacting}). \\
+Input pedigree & NASA-9/CEA thermodynamics, RP-1232 collision integrals, Park/Gnoffo kinetics, committed NEQAIR references -- all traceable to primary sources. \\
+Results uncertainty & Three-grid GCI ($F_s{=}1.25$) harness feeding ASME V\&V 20 $U_{\mathrm{val}}$; per-equation convergence monitoring. \\
+Results robustness & Positivity floors and realizability bounds; precision-scaled tolerances verified under double and single builds. \\
+Use history & New code; none beyond the campaign reported here. \\
+M\&S management & Version-controlled, schema-validated input decks, bitwise-reproducible restarts, continuous integration. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Conclusion}
+
+MANTA is a modular, GPU-resident, implicit-first finite-volume solver for hypersonic aerothermodynamics in thermal and chemical nonequilibrium. One data model with two topology back-ends, ghost cells treated as ordinary cells, and runtime-selectable plugins for every model and scheme let a single code path run the same physics on structured curvilinear and unstructured polyhedral meshes, with orbit-measure axisymmetric and spherical reductions on the same kernels. On this base, the solver couples Riemann flux functions (low-Mach, entropy-stable, and carbuncle-resistant rotated and relaxation solvers among them), high-order ENO/WENO/TENO and geometry-exact radial-basis reconstructions, and a full RANS/LES/hybrid turbulence suite to PETSc-driven implicit integration -- up to AD-exact Jacobians and a certified true-Newton integrator -- with gas models from calorically perfect through equilibrium air to finite-rate Park 5- and 11-species thermochemistry with Gupta--Yos transport and ambipolar diffusion, a photon-Monte-Carlo radiation subsystem with NEQAIR-reduced opacity tables, and conservative distributed adaptive refinement.
+
+Correctness is established within the AIAA G-077 framework by evidence regenerated on every build: reconstruction operators at design order (fifth order to $\hat p=5.00$); the assembled operator at its quadrature-limited second order on both topologies -- and across adaptive-refinement interfaces -- with the cap's origin demonstrated rather than asserted; implicit and explicit integrators at design temporal order through the full matrix-free Newton--Krylov path; geometric and discrete conservation, and the symmetry reductions' well-balancing, at round-off; Jacobian consistency quantified layer by layer and closed by AD-exact boundary rows; an empirical and linearized robustness classification of every flux function, including the redesigned carbuncle correction it motivated; grid-convergence uncertainty by GCI feeding ASME V\&V 20; a formal validation suite closed with comparison errors within the validation uncertainty; and Park-5/11 kinetics in detailed balance with NASA CEA to $1.3\%$, alongside an equilibrium-air tier verified against RP-1181, LAURA, and CEA. The credibility self-assessment against NASA-STD-7009B is correspondingly strong on verification and uncertainty. This report is intended as the fixed, citable baseline against which further development -- and reduced-order models built on the solver -- will be measured.
+
+\printbibliography
+
+\end{document}
